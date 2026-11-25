@@ -1,0 +1,161 @@
+use freya::prelude::*;
+use freya::router::RouterContext;
+use oneclient_core::settings::LauncherSettings;
+
+use super::settings_page;
+use crate::Route;
+use crate::components::{IconType, link_button, toggle};
+use crate::hooks::{
+    BROWSER_COMPAT_DEFAULT, use_browser_compat, use_dispatch, use_settings_snapshot,
+};
+use crate::i18n::t;
+use crate::layout::SearchItem;
+use crate::view::app::settings::{resettable, section_header, settings_row};
+use crate::view::console::open_log_console;
+
+#[derive(PartialEq)]
+pub struct SettingsDeveloper;
+
+impl Component for SettingsDeveloper {
+    fn render(&self) -> impl IntoElement {
+        let settings = use_settings_snapshot().settings;
+        let defaults = LauncherSettings::default();
+        let dispatch = use_dispatch();
+        let nightly_dispatch = dispatch.clone();
+
+        let log_debug = use_state({
+            let v = settings.log_debug;
+            move || v
+        });
+
+        let mut first = use_state(|| true);
+        use_side_effect(move || {
+            let enabled = *log_debug.read();
+            if *first.peek() {
+                first.set(false);
+                return;
+            }
+            dispatch.edit_settings(|settings| settings.log_debug = enabled);
+        });
+
+        let nightly_bundles = use_state({
+            let v = settings.nightly_bundles;
+            move || v
+        });
+        let mut first_nightly = use_state(|| true);
+        use_side_effect(move || {
+            let enabled = *nightly_bundles.read();
+            if *first_nightly.peek() {
+                first_nightly.set(false);
+                return;
+            }
+            nightly_dispatch.set_nightly_bundles(enabled);
+        });
+
+        let browser_compat = use_browser_compat();
+
+        settings_page()
+            .child(section_header(t(
+                "oneclient.settings.developer.section.browser",
+            )))
+            .child(settings_row(
+                IconType::SearchMd,
+                t("oneclient.settings.developer.compat_only.title"),
+                t("oneclient.settings.developer.compat_only.description"),
+                resettable(
+                    toggle(browser_compat),
+                    browser_compat,
+                    BROWSER_COMPAT_DEFAULT,
+                ),
+            ))
+            .child(section_header(t(
+                "oneclient.settings.developer.section.dev_tools",
+            )))
+            .child(settings_row(
+                IconType::Sliders04,
+                t("oneclient.settings.developer.log_debug.title"),
+                t("oneclient.settings.developer.log_debug.description"),
+                resettable(toggle(log_debug), log_debug, defaults.log_debug),
+            ))
+            .child(settings_row(
+                IconType::Sliders04,
+                t("oneclient.settings.developer.nightly_bundles.title"),
+                t("oneclient.settings.developer.nightly_bundles.description"),
+                resettable(
+                    toggle(nightly_bundles),
+                    nightly_bundles,
+                    defaults.nightly_bundles,
+                ),
+            ))
+            .child(settings_row(
+                IconType::Terminal,
+                t("oneclient.settings.developer.log_console.title"),
+                t("oneclient.settings.developer.log_console.description"),
+                link_button().on_press(move |_| open_log_console()),
+            ))
+            .child(settings_row(
+                IconType::CodeSnippet02,
+                t("oneclient.settings.developer.debug_page.title"),
+                t("oneclient.settings.developer.debug_page.description"),
+                link_button().on_press(move |_| {
+                    let _ = RouterContext::get().push(Route::Debug {});
+                }),
+            ))
+            .into_element()
+    }
+}
+
+inventory::submit! {
+    SearchItem {
+        id: "developer.compat_only",
+        icon: IconType::SearchMd,
+        title: "oneclient.settings.developer.compat_only.title",
+        description: "oneclient.layout.search.developer.compat_only.description",
+        keywords: &["browser", "compat", "filter"],
+        route: Route::SettingsDeveloper {},
+    }
+}
+
+inventory::submit! {
+    SearchItem {
+        id: "developer.log_debug",
+        icon: IconType::Terminal,
+        title: "oneclient.settings.developer.log_debug.title",
+        description: "oneclient.layout.search.developer.log_debug.description",
+        keywords: &["debug", "logs", "logging"],
+        route: Route::SettingsDeveloper {},
+    }
+}
+
+inventory::submit! {
+    SearchItem {
+        id: "developer.nightly_bundles",
+        icon: IconType::Sliders04,
+        title: "oneclient.settings.developer.nightly_bundles.title",
+        description: "oneclient.layout.search.developer.nightly_bundles.description",
+        keywords: &["nightly", "stable", "bundles", "channel", "datastorage"],
+        route: Route::SettingsDeveloper {},
+    }
+}
+
+inventory::submit! {
+    SearchItem {
+        id: "developer.debug_page",
+        icon: IconType::CodeSnippet02,
+        title: "oneclient.settings.developer.debug_page.title",
+        description: "oneclient.layout.search.developer.debug_page.description",
+        keywords: &["debug", "page", "devtools", "developer"],
+        route: Route::SettingsDeveloper {},
+    }
+}
+
+inventory::submit! {
+    SearchItem {
+        id: "developer.log_console",
+        icon: IconType::Terminal,
+        title: "oneclient.settings.developer.log_console.title",
+        description: "oneclient.settings.developer.log_console.description",
+        keywords: &["log", "console", "logs", "output"],
+        route: Route::SettingsDeveloper {},
+    }
+}

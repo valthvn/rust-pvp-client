@@ -1,0 +1,1232 @@
+use sqlx::SqlitePool;
+
+use crate::models::{
+    ArtifactRow, ClusterArtifactRow, ClusterDependencyEdgeRow, ClusterKind, LinkedArtifactRow,
+    OverrideType, ProviderReleaseRow, ReleaseDependencyRow, SeenStatus, UnsyncedReleaseRow,
+};
+
+pub async fn get_artifact_by_hash(
+    pool: &SqlitePool,
+    hash: &str,
+) -> Result<Option<ArtifactRow>, sqlx::Error> {
+    sqlx::query_as!(
+        ArtifactRow,
+        r#"
+		SELECT hash, content_type, path, file_name, size_bytes
+		FROM artifacts
+		WHERE hash = ?
+		"#,
+        hash
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn insert_artifact(
+    pool: &SqlitePool,
+    hash: &str,
+    content_type: i64,
+    path: &str,
+    file_name: &str,
+    size_bytes: Option<i64>,
+) -> Result<ArtifactRow, sqlx::Error> {
+    sqlx::query_as!(
+        ArtifactRow,
+        r#"
+		INSERT INTO artifacts (hash, content_type, path, file_name, size_bytes)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(hash) DO UPDATE SET
+			content_type = excluded.content_type,
+			path = excluded.path,
+			file_name = excluded.file_name,
+			size_bytes = COALESCE(excluded.size_bytes, artifacts.size_bytes)
+		RETURNING hash, content_type, path, file_name, size_bytes
+		"#,
+        hash,
+        content_type,
+        path,
+        file_name,
+        size_bytes
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// `provider_releases` cascades the cached file is the caller's to delete
+/// this layer does not touch the disk
+pub async fn delete_artifact_if_unused(pool: &SqlitePool, hash: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM artifacts WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM cluster_artifacts WHERE hash = ?) AND NOT EXISTS (SELECT 1 FROM clusters WHERE linked_modpack_hash = ?)",
+    )
+    .bind(hash)
+    .bind(hash)
+    .bind(hash)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+use crate::models::GlobalArtifactRow;
+
+/// One row per hash across `sharing` (the clusters playing from the shared
+/// folder) for content that is installed globally
+///
+/// `enabled` is the OR over the clusters: one cluster still having a pack on is
+/// enough to keep it in the folder, because there is one folder and it can only
+/// have one answer
+///
+/// Switching a pack off still reaches every cluster it goes through
+/// [`set_enabled_for_hash`], which leaves no row for this to read as on
+///
+/// Written with the runtime-checked builder rather than `query!` so it needs no
+/// entry in the offline cache
+pub async fn list_global_artifacts(
+    pool: &SqlitePool,
+    content_type: i64,
+    sharing: &[i64],
+) -> Result<Vec<GlobalArtifactRow>, sqlx::Error> {
+    sqlx::query_as::<_, GlobalArtifactRow>(
+        r#"
+		SELECT
+			ca.hash AS hash,
+			MIN(ca.cluster_file_name) AS file_name,
+			MAX(ca.enabled) AS enabled
+		FROM cluster_artifacts ca
+		JOIN artifacts a ON a.hash = ca.hash
+		WHERE a.content_type = ? AND ca.cluster_id IN (SELECT value FROM json_each(?))
+		GROUP BY ca.hash
+		"#,
+    )
+    .bind(content_type)
+    .bind(json_ids(sharing))
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn copy_global_links(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    content_type: i64,
+    sharing: &[i64],
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+		INSERT OR IGNORE INTO cluster_artifacts (
+			cluster_id, hash, cluster_file_name, enabled, bundle_name,
+			bundle_version_id, package_id, installed_at, seen_status, added_at
+		)
+		SELECT ?, hash, cluster_file_name, enabled, bundle_name,
+			bundle_version_id, package_id, installed_at, seen_status, added_at
+		FROM (
+			SELECT ca.*, ROW_NUMBER() OVER (
+				PARTITION BY ca.hash ORDER BY ca.enabled DESC, ca.cluster_file_name
+			) AS pick
+			FROM cluster_artifacts ca
+			JOIN artifacts a ON a.hash = ca.hash
+			WHERE a.content_type = ? AND ca.cluster_id IN (SELECT value FROM json_each(?))
+		)
+		WHERE pick = 1
+		"#,
+    )
+    .bind(cluster_id)
+    .bind(content_type)
+    .bind(json_ids(sharing))
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn give_global_links(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    content_type: i64,
+    sharing: &[i64],
+) -> Result<u64, sqlx::Error> {
+    let sharing = json_ids(sharing);
+    let result = sqlx::query(
+        r#"
+		INSERT OR IGNORE INTO cluster_artifacts (
+			cluster_id, hash, cluster_file_name, enabled, bundle_name,
+			bundle_version_id, package_id, installed_at, seen_status, added_at
+		)
+		SELECT s.value, ca.hash, ca.cluster_file_name, ca.enabled, ca.bundle_name,
+			ca.bundle_version_id, ca.package_id, ca.installed_at, ca.seen_status, ca.added_at
+		FROM cluster_artifacts ca
+		JOIN artifacts a ON a.hash = ca.hash
+		JOIN json_each(?) s
+		WHERE ca.cluster_id = ? AND a.content_type = ? AND ca.enabled = 1
+			AND NOT EXISTS (
+				SELECT 1 FROM cluster_artifacts other
+				WHERE other.hash = ca.hash
+					AND other.cluster_id IN (SELECT value FROM json_each(?))
+			)
+		"#,
+    )
+    .bind(&sharing)
+    .bind(cluster_id)
+    .bind(content_type)
+    .bind(&sharing)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn align_global_enabled(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    content_type: i64,
+    sharing: &[i64],
+) -> Result<u64, sqlx::Error> {
+    let sharing = json_ids(sharing);
+    let result = sqlx::query(
+        r#"
+		UPDATE cluster_artifacts SET enabled = shared.enabled
+		FROM (
+			SELECT other.hash, MAX(other.enabled) AS enabled
+			FROM cluster_artifacts other
+			JOIN artifacts a ON a.hash = other.hash
+			WHERE a.content_type = ? AND other.cluster_id != ?
+				AND other.cluster_id IN (SELECT value FROM json_each(?))
+			GROUP BY other.hash
+		) AS shared
+		WHERE cluster_artifacts.cluster_id = ? AND cluster_artifacts.hash = shared.hash
+			AND cluster_artifacts.enabled != shared.enabled
+		"#,
+    )
+    .bind(content_type)
+    .bind(cluster_id)
+    .bind(&sharing)
+    .bind(cluster_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+fn json_ids(ids: &[i64]) -> String {
+    format!(
+        "[{}]",
+        ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+    )
+}
+
+/// Sets the flag on every cluster sharing the global folder that has this artifact
+///
+/// Globally installed content has one folder so writing only the row of
+/// whichever cluster the user happened to be looking at would leave the rest
+/// disagreeing with what is on disk
+pub async fn set_enabled_for_hash(
+    pool: &SqlitePool,
+    hash: &str,
+    enabled: i64,
+    sharing: &[i64],
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+		UPDATE cluster_artifacts SET enabled = ?
+		WHERE hash = ? AND cluster_id IN (SELECT value FROM json_each(?))
+		"#,
+    )
+    .bind(enabled)
+    .bind(hash)
+    .bind(json_ids(sharing))
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn list_unused_artifacts(pool: &SqlitePool) -> Result<Vec<ArtifactRow>, sqlx::Error> {
+    sqlx::query_as::<_, ArtifactRow>(
+        r#"
+		SELECT hash, content_type, path, file_name, size_bytes
+		FROM artifacts
+		WHERE hash NOT IN (SELECT hash FROM cluster_artifacts)
+		AND hash NOT IN (SELECT linked_modpack_hash FROM clusters WHERE linked_modpack_hash IS NOT NULL)
+		"#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_artifact_paths(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT path FROM artifacts")
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows.into_iter().map(|(path,)| path).collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_provider_release(
+    pool: &SqlitePool,
+    provider_id: i64,
+    project_id: &str,
+    version_id: &str,
+    hash: &str,
+    display_name: &str,
+    display_version: &str,
+    published_at: Option<&str>,
+    mc_versions: &str,
+    mc_loaders: &str,
+) -> Result<ProviderReleaseRow, sqlx::Error> {
+    sqlx::query_as!(
+        ProviderReleaseRow,
+        r#"
+		INSERT INTO provider_releases (
+			provider, project_id, version_id, hash,
+			display_name, display_version, published_at, mc_versions, mc_loaders
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provider, project_id, version_id) DO UPDATE SET
+			hash = excluded.hash,
+			display_name = excluded.display_name,
+			display_version = excluded.display_version,
+			published_at = excluded.published_at,
+			mc_versions = excluded.mc_versions,
+			mc_loaders = excluded.mc_loaders
+		RETURNING
+			provider as "provider!: i64", project_id, version_id, hash,
+			display_name, display_version, published_at, mc_versions, mc_loaders
+		"#,
+        provider_id,
+        project_id,
+        version_id,
+        hash,
+        display_name,
+        display_version,
+        published_at,
+        mc_versions,
+        mc_loaders
+    )
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn get_provider_release(
+    pool: &SqlitePool,
+    provider_id: i64,
+    project_id: &str,
+    version_id: &str,
+) -> Result<Option<ProviderReleaseRow>, sqlx::Error> {
+    sqlx::query_as!(
+        ProviderReleaseRow,
+        r#"
+		SELECT
+			provider as "provider!: i64", project_id, version_id, hash,
+			display_name, display_version, published_at, mc_versions, mc_loaders
+		FROM provider_releases
+		WHERE provider = ? AND project_id = ? AND version_id = ?
+		"#,
+        provider_id,
+        project_id,
+        version_id
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_release_by_hash(
+    pool: &SqlitePool,
+    hash: &str,
+) -> Result<Option<ProviderReleaseRow>, sqlx::Error> {
+    sqlx::query_as!(
+        ProviderReleaseRow,
+        r#"
+		SELECT
+			provider as "provider!: i64", project_id, version_id, hash,
+			display_name, display_version, published_at, mc_versions, mc_loaders
+		FROM provider_releases
+		WHERE hash = ?
+		LIMIT 1
+		"#,
+        hash
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Replaces a release's recorded dependency list.
+///
+/// Delete-then-insert rather than an upsert per row: a version that dropped a
+/// dependency between two passes has to lose the row, or the reverse lookup
+/// would keep reporting a package as needed by something that no longer needs
+/// it. Empty `dependencies` is meaningful and still marks the release synced.
+pub async fn replace_release_dependencies(
+	pool: &SqlitePool,
+	provider_id: i64,
+	project_id: &str,
+	version_id: &str,
+	dependencies: &[(String, String, String)],
+) -> Result<(), sqlx::Error> {
+	let mut tx = pool.begin().await?;
+
+	sqlx::query!(
+		r#"
+		DELETE FROM provider_release_dependencies
+		WHERE provider = ? AND project_id = ? AND version_id = ?
+		"#,
+		provider_id,
+		project_id,
+		version_id
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	for (dependency_project_id, dependency_version_id, kind) in dependencies {
+		sqlx::query!(
+			r#"
+			INSERT INTO provider_release_dependencies (
+				provider, project_id, version_id,
+				dependency_project_id, dependency_version_id, kind
+			)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(provider, project_id, version_id, dependency_project_id, dependency_version_id)
+			DO UPDATE SET kind = excluded.kind
+			"#,
+			provider_id,
+			project_id,
+			version_id,
+			dependency_project_id,
+			dependency_version_id,
+			kind
+		)
+		.execute(&mut *tx)
+		.await?;
+	}
+
+	sqlx::query!(
+		r#"
+		UPDATE provider_releases
+		SET dependencies_synced_at = datetime('now')
+		WHERE provider = ? AND project_id = ? AND version_id = ?
+		"#,
+		provider_id,
+		project_id,
+		version_id
+	)
+	.execute(&mut *tx)
+	.await?;
+
+	tx.commit().await
+}
+
+pub async fn list_release_dependencies(
+	pool: &SqlitePool,
+	provider_id: i64,
+	project_id: &str,
+	version_id: &str,
+) -> Result<Vec<ReleaseDependencyRow>, sqlx::Error> {
+	sqlx::query_as!(
+		ReleaseDependencyRow,
+		r#"
+		SELECT dependency_project_id, dependency_version_id, kind
+		FROM provider_release_dependencies
+		WHERE provider = ? AND project_id = ? AND version_id = ?
+		"#,
+		provider_id,
+		project_id,
+		version_id
+	)
+	.fetch_all(pool)
+	.await
+}
+
+/// Every dependency declared by an artifact this cluster has installed.
+///
+/// One query for the whole cluster: the reverse graph is only useful whole, and
+/// walking it one package at a time would be a round trip per hop.
+pub async fn list_cluster_dependency_edges(
+	pool: &SqlitePool,
+	cluster_id: i64,
+) -> Result<Vec<ClusterDependencyEdgeRow>, sqlx::Error> {
+	sqlx::query_as!(
+		ClusterDependencyEdgeRow,
+		r#"
+		SELECT
+			ca.hash,
+			pr.provider as "provider!: i64",
+			prd.dependency_project_id,
+			prd.dependency_version_id,
+			prd.kind
+		FROM cluster_artifacts ca
+		JOIN provider_releases pr ON pr.hash = ca.hash
+		JOIN provider_release_dependencies prd
+			ON prd.provider = pr.provider
+			AND prd.project_id = pr.project_id
+			AND prd.version_id = pr.version_id
+		WHERE ca.cluster_id = ?
+		"#,
+		cluster_id
+	)
+	.fetch_all(pool)
+	.await
+}
+
+/// Every provider identity for each linked file. A release shared between
+/// providers or re-published under another version may be a dependency by any of these IDs.
+pub async fn list_cluster_release_identities(
+    pool: &SqlitePool,
+    cluster_id: i64,
+) -> Result<Vec<crate::models::ClusterReleaseIdentityRow>, sqlx::Error> {
+    sqlx::query_as::<_, crate::models::ClusterReleaseIdentityRow>(
+        "SELECT ca.hash, pr.provider, pr.project_id, pr.version_id
+         FROM cluster_artifacts ca JOIN provider_releases pr ON pr.hash = ca.hash
+         WHERE ca.cluster_id = ?",
+    )
+    .bind(cluster_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// The cluster's releases whose dependency list has never been recorded.
+///
+/// Everything installed before the dependency table existed lands here, which
+/// is what the backfill walks.
+pub async fn list_releases_missing_dependencies(
+	pool: &SqlitePool,
+	cluster_id: i64,
+) -> Result<Vec<UnsyncedReleaseRow>, sqlx::Error> {
+	sqlx::query_as!(
+		UnsyncedReleaseRow,
+		r#"
+		SELECT DISTINCT
+			pr.provider as "provider!: i64",
+			pr.project_id,
+			pr.version_id
+		FROM cluster_artifacts ca
+		JOIN provider_releases pr ON pr.hash = ca.hash
+		WHERE ca.cluster_id = ? AND pr.dependencies_synced_at IS NULL
+		"#,
+		cluster_id
+	)
+	.fetch_all(pool)
+	.await
+}
+
+/// Switches off a set of the cluster's artifacts, and records the matching
+/// bundle overrides, in one transaction.
+///
+/// The set is written whole or not at all. It is handed in as a set because a
+/// package is disabled together with everything that requires it, and a
+/// half-applied closure would leave the cluster in a state the user never
+/// picked — mods enabled with their library gone is exactly the crash the
+/// warning exists to prevent.
+///
+/// Bundle bookkeeping happens here rather than a layer up for the same reason:
+/// the override says "the user turned this off", and it belongs in the
+/// transaction that turns it off. `overrides` carries the rows that have no
+/// artifact of their own, i.e. a bundle package the cluster has not installed.
+pub async fn disable_cluster_artifacts(
+	pool: &SqlitePool,
+	cluster_id: i64,
+	hashes: &[String],
+	overrides: &[(String, String)],
+) -> Result<Vec<ClusterArtifactRow>, sqlx::Error> {
+	let mut tx = pool.begin().await?;
+	let mut updated = Vec::with_capacity(hashes.len());
+
+	for hash in hashes {
+		let Some(row) = sqlx::query!(
+			r#"
+			SELECT cluster_file_name, bundle_name, package_id
+			FROM cluster_artifacts
+			WHERE cluster_id = ? AND hash = ?
+			"#,
+			cluster_id,
+			hash
+		)
+		.fetch_optional(&mut *tx)
+		.await?
+		else {
+			continue;
+		};
+
+		// The suffix is how a disabled file used to be marked in the game
+		// folder; the flag is authoritative now, so the stored name is kept
+		// clean either way.
+		let file_name = row.cluster_file_name.trim_end_matches(".disabled").to_string();
+
+		updated.push(
+			sqlx::query_as!(
+				ClusterArtifactRow,
+				r#"
+				UPDATE cluster_artifacts
+				SET cluster_file_name = ?, enabled = 0
+				WHERE cluster_id = ? AND hash = ?
+				RETURNING cluster_id, hash, cluster_file_name, enabled, seen_status
+				"#,
+				file_name,
+				cluster_id,
+				hash
+			)
+			.fetch_one(&mut *tx)
+			.await?,
+		);
+
+		if let (Some(bundle_name), Some(package_id)) = (row.bundle_name, row.package_id) {
+			save_override_tx(&mut tx, cluster_id, &bundle_name, &package_id).await?;
+		}
+	}
+
+	for (bundle_name, package_id) in overrides {
+		save_override_tx(&mut tx, cluster_id, bundle_name, package_id).await?;
+	}
+
+	tx.commit().await?;
+	Ok(updated)
+}
+
+async fn save_override_tx(
+	tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+	cluster_id: i64,
+	bundle_name: &str,
+	package_id: &str,
+) -> Result<(), sqlx::Error> {
+	let override_type = OverrideType::Disabled.as_str();
+	sqlx::query!(
+		r#"
+		INSERT INTO cluster_bundle_overrides (cluster_id, bundle_name, package_id, override_type)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(cluster_id, bundle_name, package_id) DO UPDATE SET
+			override_type = excluded.override_type
+		"#,
+		cluster_id,
+		bundle_name,
+		package_id,
+		override_type
+	)
+	.execute(&mut **tx)
+	.await?;
+	Ok(())
+}
+
+pub async fn link_cluster_artifact(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    hash: &str,
+    cluster_file_name: &str,
+) -> Result<ClusterArtifactRow, sqlx::Error> {
+    link_cluster_artifact_recording_addition(pool, cluster_id, hash, cluster_file_name)
+        .await
+        .map(|(link, _)| link)
+}
+
+/// Returns the timestamp only when this operation created the link.
+pub async fn link_cluster_artifact_recording_addition(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    hash: &str,
+    cluster_file_name: &str,
+) -> Result<(ClusterArtifactRow, Option<String>), sqlx::Error> {
+    // Undo identifies a manual link by its timestamp. An upsert leaves it alone,
+    // while unlinking and reinstalling the same hash must give it a new identity.
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST_LINK: AtomicI64 = AtomicI64::new(0);
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let previous = LAST_LINK.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        Some(now.max(last + 1))
+    }).unwrap_or_else(|last| last);
+    let added_at = chrono::DateTime::from_timestamp_nanos(now.max(previous + 1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+
+    let (cluster_id, hash, cluster_file_name, enabled, seen_status, stored_added_at) =
+        sqlx::query_as::<_, (i64, String, String, i64, i64, Option<String>)>(
+            r#"
+            INSERT INTO cluster_artifacts (cluster_id, hash, cluster_file_name, enabled, added_at)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(cluster_id, hash) DO UPDATE SET
+                cluster_file_name = excluded.cluster_file_name
+            RETURNING cluster_id, hash, cluster_file_name, enabled, seen_status, added_at
+            "#,
+        )
+        .bind(cluster_id)
+        .bind(hash)
+        .bind(cluster_file_name)
+        .bind(&added_at)
+        .fetch_one(pool)
+        .await?;
+
+    Ok((
+        ClusterArtifactRow { cluster_id, hash, cluster_file_name, enabled, seen_status },
+        stored_added_at.filter(|stored| stored == &added_at),
+    ))
+}
+
+pub async fn matches_manual_artifact_link(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    hash: &str,
+    added_at: &str,
+) -> Result<bool, sqlx::Error> {
+    let found = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM cluster_artifacts WHERE cluster_id = ? AND hash = ? AND added_at = ?
+         AND bundle_name IS NULL AND package_id IS NULL",
+    )
+    .bind(cluster_id)
+    .bind(hash)
+    .bind(added_at)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.is_some())
+}
+
+/// Removes a dependency group atomically. If any link changed ownership or was
+/// replaced since the plan, keep every link so no remaining package is broken.
+pub async fn unlink_unchanged_manual_artifacts(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    artifacts: &[(&str, &str)],
+) -> Result<Option<Vec<ClusterArtifactRow>>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let mut links = Vec::with_capacity(artifacts.len());
+    for (hash, added_at) in artifacts {
+        let removed = sqlx::query_as::<_, ClusterArtifactRow>(
+            "DELETE FROM cluster_artifacts WHERE cluster_id = ? AND hash = ? AND added_at = ?
+             AND bundle_name IS NULL AND package_id IS NULL
+             RETURNING cluster_id, hash, cluster_file_name, enabled, seen_status",
+        )
+        .bind(cluster_id)
+        .bind(hash)
+        .bind(added_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(removed) = removed else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        links.push(removed);
+    }
+    tx.commit().await?;
+    Ok(Some(links))
+}
+
+/// `DISTINCT` is required `provider_releases` is keyed by version so one
+/// artifact joins several rows and would otherwise be reported repeatedly
+pub async fn list_cluster_artifacts_for_project(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    provider: i64,
+    project_id: &str,
+    exclude_hash: &str,
+) -> Result<Vec<ClusterArtifactRow>, sqlx::Error> {
+    sqlx::query_as!(
+        ClusterArtifactRow,
+        r#"
+		SELECT DISTINCT ca.cluster_id, ca.hash, ca.cluster_file_name, ca.enabled, ca.seen_status
+		FROM cluster_artifacts ca
+		JOIN provider_releases pr ON pr.hash = ca.hash
+		WHERE ca.cluster_id = ?
+			AND pr.provider = ?
+			AND pr.project_id = ?
+			AND ca.hash <> ?
+		"#,
+        cluster_id,
+        provider,
+        project_id,
+        exclude_hash
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn is_cluster_linked(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    hash: &str,
+) -> Result<bool, sqlx::Error> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM cluster_artifacts WHERE cluster_id = ? AND hash = ? LIMIT 1")
+            .bind(cluster_id)
+            .bind(hash)
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(row.is_some())
+}
+
+pub async fn list_clusters_linking(pool: &SqlitePool, hash: &str) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT cluster_id FROM cluster_artifacts WHERE hash = ?")
+        .bind(hash)
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn is_launcher_owned(pool: &SqlitePool, hash: &str) -> Result<bool, sqlx::Error> {
+    let owned: i64 = sqlx::query_scalar(
+        r#"
+		SELECT EXISTS (
+			SELECT 1 FROM artifacts a
+			WHERE a.hash = ?
+			AND (
+				NOT EXISTS (SELECT 1 FROM cluster_artifacts ca WHERE ca.hash = a.hash)
+				OR EXISTS (
+					SELECT 1 FROM cluster_artifacts ca
+					LEFT JOIN clusters c ON c.id = ca.cluster_id
+					WHERE ca.hash = a.hash AND (c.id IS NULL OR c.kind = ?)
+				)
+			)
+		)
+		"#,
+    )
+    .bind(hash)
+    .bind(ClusterKind::OneClient.as_i64())
+    .fetch_one(pool)
+    .await?;
+
+    Ok(owned != 0)
+}
+
+pub async fn unlink_cluster_artifact(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "DELETE FROM cluster_artifacts WHERE cluster_id = ? AND hash = ?",
+        cluster_id,
+        hash
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// One artifact can carry several `provider_releases` rows so the release
+/// columns are taken from a single row picked by a total order rather than
+/// grouped which lets SQLite mix columns from different rows
+pub async fn list_cluster_artifacts_detailed(
+    pool: &SqlitePool,
+    cluster_id: i64,
+) -> Result<Vec<LinkedArtifactRow>, sqlx::Error> {
+    sqlx::query_as!(
+        LinkedArtifactRow,
+        r#"
+		SELECT
+			ca.hash AS "hash!: String",
+			ca.cluster_file_name AS "cluster_file_name!: String",
+			ca.enabled AS "enabled!: i64",
+			ca.seen_status AS "seen_status!: i64",
+			a.content_type AS "content_type!: i64",
+			a.file_name AS "file_name!: String",
+			a.size_bytes AS "size_bytes?: i64",
+			pr.provider AS "provider?: i64",
+			pr.project_id AS "project_id?: String",
+			pr.version_id AS "version_id?: String",
+			pr.display_name AS "display_name?: String",
+			pr.display_version AS "display_version?: String",
+			pr.published_at AS "published_at?: String",
+			ca.added_at AS "added_at?: String"
+		FROM cluster_artifacts ca
+		JOIN artifacts a ON a.hash = ca.hash
+		LEFT JOIN provider_releases pr ON pr.rowid = (
+			SELECT rowid
+			FROM provider_releases
+			WHERE hash = ca.hash
+			ORDER BY published_at DESC, provider, project_id, version_id
+			LIMIT 1
+		)
+		WHERE ca.cluster_id = ?
+		"#,
+        cluster_id
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn fill_cluster_artifact_added_at(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    hash: &str,
+    added_at: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cluster_artifacts SET added_at = ? \
+         WHERE cluster_id = ? AND hash = ? AND added_at IS NULL",
+    )
+    .bind(added_at)
+    .bind(cluster_id)
+    .bind(hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_cluster_artifact(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    hash: &str,
+) -> Result<Option<ClusterArtifactRow>, sqlx::Error> {
+    sqlx::query_as!(
+        ClusterArtifactRow,
+        r#"
+		SELECT cluster_id, hash, cluster_file_name, enabled, seen_status
+		FROM cluster_artifacts
+		WHERE cluster_id = ? AND hash = ?
+		"#,
+        cluster_id,
+        hash
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn update_cluster_artifact(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    hash: &str,
+    cluster_file_name: &str,
+    enabled: i64,
+) -> Result<ClusterArtifactRow, sqlx::Error> {
+    sqlx::query_as!(
+        ClusterArtifactRow,
+        r#"
+		UPDATE cluster_artifacts
+		SET cluster_file_name = ?, enabled = ?
+		WHERE cluster_id = ? AND hash = ?
+		RETURNING cluster_id, hash, cluster_file_name, enabled, seen_status
+		"#,
+        cluster_file_name,
+        enabled,
+        cluster_id,
+        hash
+    )
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn set_seen_status(
+    pool: &SqlitePool,
+    cluster_id: i64,
+    hash: &str,
+    status: SeenStatus,
+) -> Result<(), sqlx::Error> {
+    let status = status.as_i64();
+
+    let result = sqlx::query!(
+        r#"
+		UPDATE cluster_artifacts
+		SET seen_status = ?
+		WHERE cluster_id = ? AND hash = ?
+		"#,
+        status,
+        cluster_id,
+        hash
+    )
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        tracing::warn!(
+            cluster_id,
+            hash,
+            "no cluster artifact matched the seen status update"
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn mark_all_seen(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let seen = SeenStatus::Seen.as_i64();
+
+    let result = sqlx::query!(
+        "UPDATE cluster_artifacts SET seen_status = ? WHERE seen_status <> ?",
+        seen,
+        seen
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dao::cluster as cluster_dao;
+    use crate::models::NewCluster;
+
+    async fn pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::migrate!().run(&pool).await.expect("migrations run");
+        pool
+    }
+
+    async fn seed_cluster(pool: &SqlitePool) -> i64 {
+        cluster_dao::insert(
+            pool,
+            &NewCluster {
+                name: "26.1 fabric",
+                folder_name: "26.1 fabric",
+                mc_version: "26.1",
+                mc_loader: 1,
+                mc_loader_version: None,
+                setting_profile_name: None,
+                stage: 0,
+                kind: 0,
+                user_created: 0,
+                description: None,
+                tags: "[]",
+                cover_path: None,
+            },
+        )
+        .await
+        .expect("insert cluster")
+        .id
+    }
+
+    #[tokio::test]
+    async fn undo_can_remove_only_the_original_manual_link() {
+        let pool = pool().await;
+        let cluster_id = seed_cluster(&pool).await;
+        let hash = "undo_hash";
+        let file = "example.jar";
+        insert_artifact(&pool, hash, 0, "a/example.jar", file, None)
+            .await
+            .unwrap();
+
+        let (_, original) = link_cluster_artifact_recording_addition(&pool, cluster_id, hash, file)
+            .await
+            .unwrap();
+        let original = original.unwrap();
+        let (_, upsert) = link_cluster_artifact_recording_addition(&pool, cluster_id, hash, file)
+            .await
+            .unwrap();
+        assert_eq!(upsert, None);
+
+        unlink_cluster_artifact(&pool, cluster_id, hash).await.unwrap();
+        let (_, replacement) = link_cluster_artifact_recording_addition(&pool, cluster_id, hash, file)
+            .await
+            .unwrap();
+        let replacement = replacement.unwrap();
+        assert_ne!(original, replacement);
+        assert!(
+            unlink_unchanged_manual_artifacts(&pool, cluster_id, &[(hash, &original)])
+                .await.unwrap().is_none()
+        );
+
+        crate::dao::cluster_bundle::track_bundle_artifact(&pool, cluster_id, hash, "bundle", "v1", "pkg")
+            .await.unwrap();
+        assert!(
+            unlink_unchanged_manual_artifacts(&pool, cluster_id, &[(hash, &replacement)])
+                .await.unwrap().is_none()
+        );
+        crate::dao::cluster_bundle::clear_bundle_tracking(&pool, cluster_id, hash)
+            .await.unwrap();
+        assert!(
+            unlink_unchanged_manual_artifacts(&pool, cluster_id, &[(hash, &replacement)])
+                .await.unwrap().is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_link_rolls_back_the_entire_undo_group() {
+        let pool = pool().await;
+        let cluster_id = seed_cluster(&pool).await;
+        let mut links = Vec::new();
+
+        for hash in ["first", "second"] {
+            let file = format!("{hash}.jar");
+            insert_artifact(&pool, hash, 0, &file, &file, None)
+                .await
+                .unwrap();
+            let (_, stamp) = link_cluster_artifact_recording_addition(
+                &pool, cluster_id, hash, &file,
+            ).await.unwrap();
+            links.push((hash, stamp.unwrap()));
+        }
+
+        assert!(unlink_unchanged_manual_artifacts(
+            &pool, cluster_id, &[("first", &links[0].1), ("second", "stale")],
+        ).await.unwrap().is_none());
+
+        for (hash, stamp) in &links {
+            assert!(matches_manual_artifact_link(&pool, cluster_id, hash, stamp).await.unwrap());
+        }
+        let candidates: Vec<_> = links.iter().map(|(hash, stamp)| (*hash, stamp.as_str())).collect();
+        assert_eq!(unlink_unchanged_manual_artifacts(&pool, cluster_id, &candidates)
+            .await.unwrap().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dependency_resolution_sees_all_provider_and_version_aliases() {
+        let pool = pool().await;
+        let cluster_id = seed_cluster(&pool).await;
+        let hash = "same_file";
+        insert_artifact(&pool, hash, 0, "mod.jar", "mod.jar", None).await.unwrap();
+        link_cluster_artifact(&pool, cluster_id, hash, "mod.jar").await.unwrap();
+        let releases = [(0, "modrinth-project", "first-version"),
+                        (0, "modrinth-project", "second-version"),
+                        (1, "curseforge-project", "other-version")];
+        for (provider, project, version) in releases {
+            upsert_provider_release(
+                &pool, provider, project, version, hash, "Mod", version, None, "[]", "[]",
+            ).await.unwrap();
+        }
+
+        let identities = list_cluster_release_identities(&pool, cluster_id).await.unwrap();
+        let mut actual = identities.iter().map(|identity| {
+            assert_eq!(identity.hash, hash);
+            (identity.provider, identity.project_id.as_str(), identity.version_id.as_str())
+        }).collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, releases);
+    }
+
+    #[tokio::test]
+    async fn detailed_listing_matches_the_lookups_it_replaced() {
+        let pool = pool().await;
+        let cluster_id = seed_cluster(&pool).await;
+
+        insert_artifact(
+            &pool,
+            "hash_managed",
+            0,
+            "a/managed.jar",
+            "managed.jar",
+            Some(1),
+        )
+        .await
+        .expect("insert managed artifact");
+        insert_artifact(&pool, "hash_local", 0, "a/local.jar", "local.jar", None)
+            .await
+            .expect("insert local artifact");
+
+        for version in ["v1", "v2"] {
+            upsert_provider_release(
+                &pool,
+                1,
+                "sodium",
+                version,
+                "hash_managed",
+                "Sodium",
+                version,
+                None,
+                "[]",
+                "[]",
+            )
+            .await
+            .expect("insert release");
+        }
+
+        link_cluster_artifact(&pool, cluster_id, "hash_managed", "managed.jar")
+            .await
+            .expect("link managed");
+        link_cluster_artifact(&pool, cluster_id, "hash_local", "local.jar")
+            .await
+            .expect("link local");
+        update_cluster_artifact(&pool, cluster_id, "hash_local", "local.jar", 0)
+            .await
+            .expect("disable local");
+
+        let rows = list_cluster_artifacts_detailed(&pool, cluster_id)
+            .await
+            .expect("detailed listing");
+
+        assert_eq!(rows.len(), 2, "one row per link, not per provider release");
+
+        let managed = rows
+            .iter()
+            .find(|r| r.hash == "hash_managed")
+            .expect("managed row");
+        assert_eq!(managed.file_name, "managed.jar");
+        assert_eq!(managed.enabled, 1);
+        assert_eq!(managed.project_id.as_deref(), Some("sodium"));
+        assert_eq!(managed.provider, Some(1));
+        assert_eq!(managed.version_id.as_deref(), Some("v1"));
+        assert_eq!(
+            managed.display_version.as_deref(),
+            Some("v1"),
+            "every release column comes from the same release row"
+        );
+
+        let local = rows
+            .iter()
+            .find(|r| r.hash == "hash_local")
+            .expect("local row");
+        assert_eq!(local.enabled, 0);
+        assert!(
+            local.project_id.is_none(),
+            "a local file has no provider columns"
+        );
+
+        let mut conn = pool.acquire().await.expect("connection");
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await
+            .expect("disable foreign keys");
+        sqlx::query!("DELETE FROM artifacts WHERE hash = ?", "hash_local")
+            .execute(&mut *conn)
+            .await
+            .expect("drop artifact row");
+        let orphans: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM cluster_artifacts WHERE hash = ?")
+                .bind("hash_local")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("count orphan link");
+        assert_eq!(orphans, 1, "the link must outlive its artifact row");
+        drop(conn);
+
+        let rows = list_cluster_artifacts_detailed(&pool, cluster_id)
+            .await
+            .expect("detailed listing after delete");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "hash_managed");
+    }
+
+    #[tokio::test]
+    async fn a_pack_handed_over_outlives_the_cluster_that_listed_it() {
+        let pool = pool().await;
+        let leaving = seed_cluster(&pool).await;
+        let staying = cluster_dao::insert(
+            &pool,
+            &NewCluster {
+                name: "26.2 fabric",
+                folder_name: "26.2 fabric",
+                mc_version: "26.2",
+                mc_loader: 1,
+                mc_loader_version: None,
+                setting_profile_name: None,
+                stage: 0,
+                kind: 0,
+                user_created: 0,
+                description: None,
+                tags: "[]",
+                cover_path: None,
+            },
+        )
+        .await
+        .expect("insert cluster")
+        .id;
+
+        insert_artifact(&pool, "hash_pack", 1, "a/pack.zip", "pack.zip", None)
+            .await
+            .expect("insert pack");
+        link_cluster_artifact(&pool, leaving, "hash_pack", "pack.zip")
+            .await
+            .expect("link pack");
+
+        give_global_links(&pool, leaving, 1, &[staying])
+            .await
+            .expect("hand over");
+        cluster_dao::delete_by_id(&pool, leaving)
+            .await
+            .expect("delete cluster");
+
+        let rows = list_global_artifacts(&pool, 1, &[staying])
+            .await
+            .expect("list packs");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "hash_pack");
+        assert_eq!(rows[0].enabled, 1);
+    }
+}

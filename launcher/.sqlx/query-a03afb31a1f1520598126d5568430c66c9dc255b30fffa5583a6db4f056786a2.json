@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT cluster_id, pending_exit, started_at, retry_note, finishing, search\n        FROM cluster_bisect_sessions\n        WHERE cluster_id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "cluster_id",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "cluster_bisect_sessions",
+            "name": "cluster_id"
+          }
+        }
+      },
+      {
+        "name": "pending_exit",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "cluster_bisect_sessions",
+            "name": "pending_exit"
+          }
+        }
+      },
+      {
+        "name": "started_at",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cluster_bisect_sessions",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "name": "retry_note",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cluster_bisect_sessions",
+            "name": "retry_note"
+          }
+        }
+      },
+      {
+        "name": "finishing",
+        "ordinal": 4,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "cluster_bisect_sessions",
+            "name": "finishing"
+          }
+        }
+      },
+      {
+        "name": "search",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cluster_bisect_sessions",
+            "name": "search"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "a03afb31a1f1520598126d5568430c66c9dc255b30fffa5583a6db4f056786a2"
+}
