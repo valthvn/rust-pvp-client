@@ -1,0 +1,9235 @@
+//! Bounded voxel-column terrain for distances beyond the resident chunk area.
+//! Far tiles never enter World, lighting, simulation or the section cave graph.
+use crate::{
+    blocks::BlockFacts,
+    chunk::{Chunk, MIN_Y},
+    fast_hash::{FxHashMap, FxHashSet},
+    mesher::SectionMesh,
+    streaming::{LodSource, WorkerContext},
+};
+pub mod bake;
+pub mod cache;
+mod detail;
+mod kept;
+mod mesh;
+#[cfg(test)]
+pub(crate) use mesh::{far_look, far_top_vertex};
+pub mod packed;
+mod samples;
+use horizon_world::registry::BlockStateId;
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+};
+
+const CELLS: usize = 16;
+const MAX_SAVED: usize = 1024;
+/// How many resident chunks may wait for the worker's summary at once
+/// (`Lod::observing`).
+pub const OBSERVE_AHEAD: usize = 8;
+const SAMPLE_JOBS: usize = 4;
+/// Sample jobs queued per sampling thread once the near terrain is in.
+/// Results are taken and jobs started once a frame: with four in flight, a
+/// tile taking milliseconds left the threads idle for most of a slow frame
+/// (2-3 fps on a CPU renderer, with far terrain a few tiles a frame).
+const QUEUED_PER_SAMPLER: usize = 32;
+/// The last `refresh`es `Lod::refreshed_since` tells apart by area.
+const MAX_REFRESHED: usize = 64;
+/// Threads that sample far tiles beside the mesher. Sampling is the cold-load
+/// bottleneck (each task evaluates a shared density lattice for 256 columns),
+/// so medium machines use two thirds of their cores, not half.
+///
+/// The mesher has little to do until tiles are sampled, so its threads sit
+/// idle through the part of a cold build that waits on sampling. Measured on
+/// a 12-thread machine building 4336 tiles at LOD distance 256, from the game
+/// answering the control socket until every target tile is sampled, four runs
+/// a configuration:
+///
+/// | samplers / meshers | sampling | whole build |
+/// |---|---|---|
+/// | 6 / 5 (before) | 15.0 s | 23.9 s |
+/// | 8 / 3 | 11.8 s | 18.6 s |
+/// | 9 / 2 | 10.6 s | 19.1 s |
+///
+/// Nine samplers finish sampling sooner still, but leave the mesher two
+/// threads and the whole build ends later. The cap keeps a large machine
+/// from starving its mesher, and `meshing_threads` keeps the frame and the
+/// ticks a core either way.
+fn sampling_threads(cores: usize) -> usize {
+    if cores >= 8 {
+        (cores * 2 / 3).min(8)
+    } else {
+        (cores / 4).clamp(1, 3)
+    }
+}
+/// Tile meshing used to be one worker with a whole selection batch at a time.
+/// It now has its own pool, sized so ticks and the frame keep a core.
+fn meshing_threads(cores: usize) -> usize {
+    cores
+        .saturating_sub(sampling_threads(cores) + 1)
+        .clamp(1, 16)
+}
+/// While the near terrain loads on a machine with four threads or fewer, far
+/// terrain starts one sample job at most this often and no detail: it would
+/// otherwise take the cores the near chunks and the frame need.
+const HELD_SAMPLE_STEP: std::time::Duration = std::time::Duration::from_millis(500);
+/// A world entry's first near load limits far work to about one thread
+/// (`Lod::limited`, [`FirstLoad`]). The game arms it explicitly on world or
+/// dimension entry (`Lod::arm_first_load`), so rebuilding far terrain after a
+/// shader pack change or toggling it on in an already-loaded world does not
+/// arm it; if near loading does not start within this window, it expires.
+const FIRST_LOAD_START: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long the near terrain must stay in before the first load counts as
+/// over: it can stop and start loading again from one frame to the next.
+const FIRST_LOAD_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// The longest the first load limits far work: a player who keeps moving into
+/// new terrain keeps the near terrain loading for good.
+const FIRST_LOAD_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+/// A world entry's first near load, while far terrain keeps a small share.
+///
+/// Measured on a 12-thread machine at render distance 128 and far terrain
+/// 256: with far terrain off, a new world's 52,653 near chunks were all in
+/// 104 s sooner (347 s to 243 s), the far threads taking 5 to 6 threads from
+/// the near chunk workers in the last tenth. Lowering the far threads'
+/// priority instead does not reach that: on Linux they and the near chunk
+/// workers are both 10 nice levels behind the process (`behind_server`), and
+/// the idle class, the only lower step, can't be left again by an
+/// unprivileged thread, so a machine that stays busy would starve far terrain
+/// for good. Limiting the queues ends when the near terrain is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirstLoad {
+    /// Far terrain was made at this instant; the near terrain is not loading yet.
+    Waiting(std::time::Instant),
+    /// Loading since `since`; `quiet`: not loading since then.
+    Loading {
+        since: std::time::Instant,
+        quiet: Option<std::time::Instant>,
+    },
+    Over,
+}
+impl FirstLoad {
+    fn step(self, loading: bool, now: std::time::Instant) -> Self {
+        match self {
+            Self::Waiting(made) if now.saturating_duration_since(made) >= FIRST_LOAD_START => {
+                Self::Over
+            }
+            Self::Waiting(_) if loading => Self::Loading {
+                since: now,
+                quiet: None,
+            },
+            Self::Loading { since, .. }
+                if now.saturating_duration_since(since) >= FIRST_LOAD_MAX =>
+            {
+                Self::Over
+            }
+            Self::Loading { since, quiet } => match quiet {
+                _ if loading => Self::Loading { since, quiet: None },
+                Some(at) if now.saturating_duration_since(at) >= FIRST_LOAD_SETTLE => Self::Over,
+                _ => Self::Loading {
+                    since,
+                    quiet: Some(quiet.unwrap_or(now)),
+                },
+            },
+            other => other,
+        }
+    }
+    fn holding(self) -> bool {
+        matches!(self, Self::Loading { .. })
+    }
+}
+/// How long a tile whose sampling failed (`LodSampler::grid` gave no
+/// columns: a server refused or lost it) waits before it is asked again.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+/// The most a tile a zoomed view magnifies may split past the plan it would
+/// have had ([`ZoomAim`]): cells three times smaller, so nine times the tiles
+/// where it applies. A spyglass covers about a sixteenth of the circle, so at
+/// the 4078 tiles and ~1500 quads a tile measured at `lodDistance` 256 this
+/// asks for roughly 45% more far tiles while the zoom is held, and gives them
+/// back when it is released. Four would be about 85%: raise it only with a
+/// measurement, because the cost grows with the square.
+const MAX_ZOOM_BOOST: i32 = 3;
+/// Yaw is rounded to this many degrees before it reaches the plan, so turning
+/// the mouse does not rebuild the quadtree every frame. The cone is widened by
+/// as much, so rounding never swings it off a tile being looked at.
+const ZOOM_YAW_STEP: f32 = 5.0;
+
+/// Where a zoomed view asks for finer far tiles (the `lodZoomDetail` extra).
+///
+/// `Plan::visit`'s falloff keeps a tile's cells roughly the same size on
+/// screen, which silently assumes the field of view never changes. A spyglass
+/// (`SpyglassItem`, a tenth of it) or the zoom mod breaks that: the same tile
+/// covers many times more pixels, so its cells look as coarse as a tile ten
+/// times nearer would. This asks the tiles the zoom actually magnifies to
+/// split further.
+///
+/// Only those: lifting the whole circle would ask for about a hundred times
+/// the tiles, which at the quads measured above is gigabytes of vertices. The
+/// cone is the narrowed view's, and `MAX_ZOOM_BOOST` caps how far it goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZoomAim {
+    /// The view direction in x/z, in thousandths of a unit vector.
+    dir: [i32; 2],
+    /// The cosine of the cone's half-angle, in thousandths.
+    cos_half: i32,
+    /// How many times further than the unzoomed plan a tile inside the cone
+    /// may split. Two or more; [`ZoomAim::new`] gives `None` for less.
+    boost: i32,
+}
+
+impl ZoomAim {
+    /// `fov_degrees` is the zoomed field of view and `magnification` how many
+    /// times the view is magnified (1 when it is not). `None` when the zoom is
+    /// too slight to be worth replanning for.
+    pub fn new(yaw: f32, fov_degrees: f32, magnification: f32) -> Option<Self> {
+        if !magnification.is_finite() || !fov_degrees.is_finite() || fov_degrees <= 0.0 {
+            return None;
+        }
+        let boost = (magnification.round() as i64).clamp(1, i64::from(MAX_ZOOM_BOOST)) as i32;
+        if boost < 2 {
+            return None;
+        }
+        // Half the field of view spans the screen's width; three quarters of
+        // it reaches the corners, and the rounding step is added on top.
+        let half = (fov_degrees * 0.75 + ZOOM_YAW_STEP).clamp(5.0, 90.0);
+        let radians = ((yaw / ZOOM_YAW_STEP).round() * ZOOM_YAW_STEP).to_radians();
+        // `view_vector`'s x and z: yaw 0 looks toward +z.
+        let thousandths = |v: f32| (v * 1000.0).round() as i32;
+        Some(Self {
+            dir: [thousandths(-radians.sin()), thousandths(radians.cos())],
+            cos_half: thousandths(half.to_radians().cos()),
+            boost,
+        })
+    }
+    /// Whether the cone reaches `key`, so the zoom magnifies it.
+    ///
+    /// The tile is taken as the circle around its centre that covers it, and
+    /// that circle's own angular radius widens the cone for the test, so a
+    /// tile straddling the edge counts in rather than out. A tile whose circle
+    /// reaches the camera is always in: there is no direction to compare, and
+    /// it fills the view whichever way the player faces.
+    fn covers(&self, key: TileKey, camera: [i32; 2]) -> bool {
+        let [ox, _, oz] = key.origin();
+        let size = key.size();
+        // The camera stands in the tile: it is in view whichever way the
+        // player faces, and there is no direction to compare it with. Tested
+        // on the box rather than on the circle below, whose radius a camera
+        // on a corner matches exactly -- a float coin-toss.
+        // In i64: a level 22 tile is 67 million blocks wide, so the sum
+        // at the far edge of the world overflows an i32.
+        let (ox64, oz64, size64) = (i64::from(ox), i64::from(oz), i64::from(size));
+        if (ox64..ox64 + size64).contains(&i64::from(camera[0]))
+            && (oz64..oz64 + size64).contains(&i64::from(camera[1]))
+        {
+            return true;
+        }
+        let half = f64::from(size) / 2.0;
+        let cx = f64::from(ox) + half - f64::from(camera[0]);
+        let cz = f64::from(oz) + half - f64::from(camera[1]);
+        let distance = (cx * cx + cz * cz).sqrt();
+        let radius = half * std::f64::consts::SQRT_2;
+        if distance <= radius {
+            return true;
+        }
+        let dir = [
+            f64::from(self.dir[0]) / 1000.0,
+            f64::from(self.dir[1]) / 1000.0,
+        ];
+        let cos = (cx * dir[0] + cz * dir[1]) / distance;
+        let sin = (1.0 - cos * cos).max(0.0).sqrt();
+        // cos(angle - tile radius), expanded so no inverse trigonometry runs
+        // per tile: the quadtree asks this of every node it visits.
+        let radius_sin = (radius / distance).min(1.0);
+        let radius_cos = (1.0 - radius_sin * radius_sin).max(0.0).sqrt();
+        cos * radius_cos + sin * radius_sin >= f64::from(self.cos_half) / 1000.0
+    }
+}
+
+/// The coarsest tile level: `Plan` roots cover at most `MAX_CHUNKS` chunks
+/// around (a level-22 tile is 67 million blocks wide: the whole world).
+pub(crate) const MAX_LEVEL: u8 = 22;
+/// Tiles this far from the camera (1024 chunks, as far as far terrain went
+/// before it covered the world) are planned with `WORLD_SPLIT`.
+const WORLD_START: i32 = 1024 * 16;
+/// How many tile widths away from the camera a tile of the world-wide terrain
+/// splits (`Plan::visit`: cells then span about 1/48 of the distance).
+const WORLD_SPLIT: i32 = 3;
+/// A split tile stays split until its distance passes the threshold by this
+/// ratio (`Plan::visit`): 1 / 0.95.
+const RETURN: (i64, i64) = (20, 19);
+/// The farthest `Plan` reaches, in chunks.
+pub const MAX_CHUNKS: u32 = 1 << 22;
+/// The coarsest tile level whose chunks are generated in full (trees,
+/// structures) rather than sampled: cells of up to 4 blocks, out to about
+/// 1024 blocks at Full far detail.
+const DETAIL_LEVEL: u8 = 2;
+/// Kept tiles come back a level at a time (`Lod::bring_back`) while at most
+/// this many drawn tiles wait for their meshes.
+const RETURN_BACKLOG: usize = 32;
+/// Kept tiles of cells a chunk wide or less (levels up to this) come back once
+/// the near terrain is in and the seam with it sampled, or this long after the
+/// return: their thousands of meshes held up the near chunks' and the seam's,
+/// showing caves through unmeshed ground meanwhile.
+const RETURN_FINE_LEVEL: u8 = 4;
+const RETURN_SEAM_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The most chunks one detail request asks for, one request each 250 ms:
+/// generated ones arrive at the decoration threads' pace, cached ones at once.
+const DETAIL_REQUEST: usize = 512;
+/// How long one frame spends applying far detail and visited summaries
+/// (`Lod::receive`).
+///
+/// Cached chunks answer a `DETAIL_REQUEST` all at once, and applying one
+/// copies the columns of every tile over it (`Arc::make_mut` on a snapshot a
+/// mesh job shares) and reduces the chunk to that tile's cell width. A whole
+/// burst in one frame cost 273 ms of it on the render thread, flying over far
+/// terrain at `lodDistance` 256: 18 FPS average, 482 ms at the 99th
+/// percentile, where the median frame was 6 ms. What the budget leaves waits
+/// in `Lod::detail_backlog` for the frames after it.
+const DETAIL_BUDGET: std::time::Duration = std::time::Duration::from_millis(3);
+/// Top solid face and optional fluid face, in absolute block coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Surface {
+    pub height: i32,
+    pub state: BlockStateId,
+    pub water: Option<(i32, BlockStateId)>,
+    pub biome: u16,
+}
+/// A half-open material run; gaps between runs remain air.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub min: i16,
+    pub max: i16,
+    pub state: BlockStateId,
+    pub biome: u16,
+    pub light: u16,
+}
+/// A column's material runs. Almost every far column has one to four, so
+/// they live inline: the sampler builds millions of columns and a heap
+/// allocation each dominated its memory and allocator time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Spans(smallvec::SmallVec<[Span; 4]>);
+impl Spans {
+    pub const fn new() -> Self {
+        Self(smallvec::SmallVec::new_const())
+    }
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(smallvec::SmallVec::with_capacity(capacity))
+    }
+    pub fn push(&mut self, span: Span) {
+        self.0.push(span);
+    }
+    pub fn reserve(&mut self, additional: usize) {
+        self.0.reserve(additional);
+    }
+    pub fn as_slice(&self) -> &[Span] {
+        &self.0
+    }
+}
+impl std::ops::Deref for Spans {
+    type Target = [Span];
+    fn deref(&self) -> &[Span] {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Spans {
+    fn deref_mut(&mut self) -> &mut [Span] {
+        &mut self.0
+    }
+}
+impl From<Vec<Span>> for Spans {
+    fn from(spans: Vec<Span>) -> Self {
+        Self(spans.into())
+    }
+}
+impl FromIterator<Span> for Spans {
+    fn from_iter<I: IntoIterator<Item = Span>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+impl IntoIterator for Spans {
+    type Item = Span;
+    type IntoIter = smallvec::IntoIter<[Span; 4]>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+impl<'a> IntoIterator for &'a Spans {
+    type Item = &'a Span;
+    type IntoIter = std::slice::Iter<'a, Span>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+impl<'a> IntoIterator for &'a mut Spans {
+    type Item = &'a mut Span;
+    type IntoIter = std::slice::IterMut<'a, Span>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
+    }
+}
+impl<const N: usize> PartialEq<[Span; N]> for Spans {
+    fn eq(&self, other: &[Span; N]) -> bool {
+        self.as_slice() == other
+    }
+}
+impl PartialEq<Vec<Span>> for Spans {
+    fn eq(&self, other: &Vec<Span>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+type ReduceEvent = (i16, (BlockStateId, u16, u16), i32);
+type ReduceVote = ((BlockStateId, u16), i32);
+
+/// Output buffer for [`reduce_spans_into`], letting standalone reductions stay
+/// in inline [`Spans`] while cached chunk pyramids append to a flat `Vec`.
+trait SpanSink {
+    fn last_mut(&mut self) -> Option<&mut Span>;
+    fn push(&mut self, span: Span);
+}
+
+impl SpanSink for Vec<Span> {
+    #[inline]
+    fn last_mut(&mut self) -> Option<&mut Span> {
+        self.as_mut_slice().last_mut()
+    }
+    #[inline]
+    fn push(&mut self, span: Span) {
+        Vec::push(self, span);
+    }
+}
+
+impl SpanSink for Spans {
+    #[inline]
+    fn last_mut(&mut self) -> Option<&mut Span> {
+        self.0.last_mut()
+    }
+    #[inline]
+    fn push(&mut self, span: Span) {
+        self.0.push(span);
+    }
+}
+
+/// Sweep-line reduction of a `width x width` footprint starting at `(x, z)`,
+/// appending merged spans directly into `out`.
+fn reduce_spans_into<'a>(
+    get_spans: impl Fn(usize, usize) -> &'a [Span],
+    x: usize,
+    z: usize,
+    width: usize,
+    events: &mut Vec<ReduceEvent>,
+    votes: &mut Vec<ReduceVote>,
+    out: &mut impl SpanSink,
+) {
+    events.clear();
+    votes.clear();
+    for dz in z..z + width {
+        for dx in x..x + width {
+            for span in get_spans(dx, dz) {
+                let material = (span.state, span.biome, span.light);
+                events.push((span.min, material, 1));
+                events.push((span.max, material, -1));
+            }
+        }
+    }
+    events.sort_unstable_by_key(|event| event.0);
+    let mut emitted = false;
+    let mut sky = [0i32; 16];
+    let mut block = [0i32; 16];
+    let mut occupied = 0;
+    let mut bottom = MIN_Y as i16;
+    for &(y, material, change) in events.iter() {
+        if bottom < y {
+            if occupied > 0
+                && let Some(&((state, biome), _)) = votes.iter().max_by_key(|&(material, count)| {
+                    (*count, std::cmp::Reverse((material.0.0, material.1)))
+                })
+            {
+                // Lighting must not split votes for the same material.
+                // Reduction can expose buried faces; retain the brightest
+                // actual light in this occupied footprint, per channel.
+                let light = (sky.iter().rposition(|&n| n > 0).unwrap_or(0) << 4)
+                    | (block.iter().rposition(|&n| n > 0).unwrap_or(0) << 12);
+                let span = Span {
+                    min: bottom,
+                    max: y,
+                    state,
+                    biome,
+                    light: light as u16,
+                };
+                if emitted
+                    && let Some(last) = out.last_mut()
+                    && last.max == span.min
+                    && last.state == span.state
+                    && last.biome == span.biome
+                    && last.light == span.light
+                {
+                    last.max = span.max;
+                } else {
+                    out.push(span);
+                    emitted = true;
+                }
+            }
+            bottom = y;
+        }
+        occupied += change;
+        sky[usize::from((material.2 >> 4) & 15)] += change;
+        block[usize::from((material.2 >> 12) & 15)] += change;
+        let material = (material.0, material.1);
+        if let Some(vote) = votes.iter_mut().find(|vote| vote.0 == material) {
+            vote.1 += change;
+        } else {
+            votes.push((material, change));
+        }
+    }
+}
+
+/// Compact flat storage for a grid of voxel columns (a 16x16 far tile, a saved
+/// chunk summary, or a reduced chunk level).
+///
+/// Replaces `Vec<Column>` (256 x 80 B = 20,480 B plus per-column SmallVec heap
+/// spills) with one contiguous `Vec<Span>`, compact offsets (`u16` unless
+/// total spans exceed 65,535), and optional compact [`Surface`] storage for
+/// `Lod::surface` / `Lod::ground`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TileColumns {
+    spans: Vec<Span>,
+    offsets: SpanOffsets,
+    surface: TileSurface,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SpanOffsets {
+    /// All `len` columns have zero spans.
+    Empty(usize),
+    /// `offsets[i]..offsets[i + 1]` in `spans` (length `len + 1`).
+    U16(Box<[u16]>),
+    /// Fallback when total spans exceed `u16::MAX` (length `len + 1`).
+    U32(Box<[u32]>),
+}
+
+#[derive(Clone, Debug)]
+enum TileWater16 {
+    None,
+    /// Common case: every water column in the tile shares one fluid state.
+    Uniform {
+        present: [u64; 4],
+        state: BlockStateId,
+        heights: Box<[i16; CELLS * CELLS]>,
+    },
+    /// Mixed fluid states within one tile (e.g. water and lava).
+    Mixed {
+        present: [u64; 4],
+        heights: Box<[i16; CELLS * CELLS]>,
+        states: Box<[BlockStateId; CELLS * CELLS]>,
+    },
+}
+
+impl TileWater16 {
+    #[inline]
+    fn get(&self, index: usize) -> Option<(i32, BlockStateId)> {
+        let word = index / 64;
+        let bit = 1u64 << (index % 64);
+        match self {
+            Self::None => None,
+            Self::Uniform {
+                present,
+                state,
+                heights,
+            } => (present[word] & bit != 0).then(|| (i32::from(heights[index]), *state)),
+            Self::Mixed {
+                present,
+                heights,
+                states,
+            } => (present[word] & bit != 0).then(|| (i32::from(heights[index]), states[index])),
+        }
+    }
+
+    fn clear_cell(&mut self, index: usize) {
+        let word = index / 64;
+        let bit = 1u64 << (index % 64);
+        match self {
+            Self::None => {}
+            Self::Uniform {
+                present, heights, ..
+            } => {
+                if present[word] & bit != 0 {
+                    present[word] &= !bit;
+                    heights[index] = 0;
+                    if *present == [0; 4] {
+                        *self = Self::None;
+                    }
+                }
+            }
+            Self::Mixed {
+                present,
+                heights,
+                states,
+            } => {
+                if present[word] & bit != 0 {
+                    present[word] &= !bit;
+                    heights[index] = 0;
+                    states[index] = BlockStateId(0);
+                    if *present == [0; 4] {
+                        *self = Self::None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Uniform { .. } => std::mem::size_of::<[i16; CELLS * CELLS]>(),
+            Self::Mixed { .. } => {
+                std::mem::size_of::<[i16; CELLS * CELLS]>()
+                    + std::mem::size_of::<[BlockStateId; CELLS * CELLS]>()
+            }
+        }
+    }
+}
+
+impl PartialEq for TileWater16 {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::None, Self::None) => true,
+            (
+                Self::Uniform {
+                    present: pa,
+                    state: sa,
+                    heights: ha,
+                },
+                Self::Uniform {
+                    present: pb,
+                    state: sb,
+                    heights: hb,
+                },
+            ) => pa == pb && sa == sb && ha == hb,
+            (
+                Self::Mixed {
+                    present: pa,
+                    heights: ha,
+                    states: sa,
+                },
+                Self::Mixed {
+                    present: pb,
+                    heights: hb,
+                    states: sb,
+                },
+            ) => pa == pb && ha == hb && sa == sb,
+            (Self::None, _) | (_, Self::None) => false,
+            _ => (0..CELLS * CELLS).all(|i| self.get(i) == other.get(i)),
+        }
+    }
+}
+
+impl Eq for TileWater16 {}
+
+#[derive(Clone, Debug)]
+struct TileSurface16 {
+    present: [u64; 4],
+    heights: [i16; CELLS * CELLS],
+    states: [BlockStateId; CELLS * CELLS],
+    biomes: [u16; CELLS * CELLS],
+    water: TileWater16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TileWater32 {
+    heights: [i32; CELLS * CELLS],
+    states: [BlockStateId; CELLS * CELLS],
+}
+
+#[derive(Clone, Debug)]
+struct TileSurface32 {
+    present: [u64; 4],
+    heights: [i32; CELLS * CELLS],
+    states: [BlockStateId; CELLS * CELLS],
+    biomes: [u16; CELLS * CELLS],
+    water_present: [u64; 4],
+    water: Option<Box<TileWater32>>,
+}
+
+#[derive(Clone, Debug)]
+enum TileSurface {
+    None,
+    I16(Box<TileSurface16>),
+    I32(Box<TileSurface32>),
+}
+
+impl TileSurface {
+    #[inline]
+    fn get(&self, index: usize) -> Option<Surface> {
+        if index >= CELLS * CELLS {
+            return None;
+        }
+        let word = index / 64;
+        let bit = 1u64 << (index % 64);
+        match self {
+            Self::None => None,
+            Self::I16(s) => (s.present[word] & bit != 0).then(|| Surface {
+                height: i32::from(s.heights[index]),
+                state: s.states[index],
+                water: s.water.get(index),
+                biome: s.biomes[index],
+            }),
+            Self::I32(s) => (s.present[word] & bit != 0).then(|| Surface {
+                height: s.heights[index],
+                state: s.states[index],
+                water: (s.water_present[word] & bit != 0).then(|| {
+                    let w = s
+                        .water
+                        .as_ref()
+                        .expect("water present bit matches water box");
+                    (w.heights[index], w.states[index])
+                }),
+                biome: s.biomes[index],
+            }),
+        }
+    }
+
+    fn clear_cell(&mut self, index: usize) {
+        if index >= CELLS * CELLS {
+            return;
+        }
+        let word = index / 64;
+        let bit = 1u64 << (index % 64);
+        match self {
+            Self::None => {}
+            Self::I16(s) => {
+                if s.present[word] & bit == 0 {
+                    return;
+                }
+                s.present[word] &= !bit;
+                s.heights[index] = 0;
+                s.states[index] = BlockStateId(0);
+                s.biomes[index] = 0;
+                s.water.clear_cell(index);
+                if s.present == [0; 4] {
+                    *self = Self::None;
+                }
+            }
+            Self::I32(s) => {
+                if s.present[word] & bit == 0 {
+                    return;
+                }
+                s.present[word] &= !bit;
+                s.heights[index] = 0;
+                s.states[index] = BlockStateId(0);
+                s.biomes[index] = 0;
+                if s.water_present[word] & bit != 0 {
+                    s.water_present[word] &= !bit;
+                    if let Some(w) = &mut s.water {
+                        w.heights[index] = 0;
+                        w.states[index] = BlockStateId(0);
+                    }
+                    if s.water_present == [0; 4] {
+                        s.water = None;
+                    }
+                }
+                if s.present == [0; 4] {
+                    *self = Self::None;
+                }
+            }
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::I16(s) => std::mem::size_of::<TileSurface16>() + s.water.heap_bytes(),
+            Self::I32(s) => {
+                std::mem::size_of::<TileSurface32>()
+                    + usize::from(s.water.is_some()) * std::mem::size_of::<TileWater32>()
+            }
+        }
+    }
+}
+
+impl PartialEq for TileSurface {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::None, Self::None) => true,
+            (Self::I16(a), Self::I16(b)) => {
+                a.present == b.present
+                    && a.heights == b.heights
+                    && a.states == b.states
+                    && a.biomes == b.biomes
+                    && a.water == b.water
+            }
+            (Self::I32(a), Self::I32(b)) => {
+                a.present == b.present
+                    && a.heights == b.heights
+                    && a.states == b.states
+                    && a.biomes == b.biomes
+                    && a.water_present == b.water_present
+                    && a.water == b.water
+            }
+            (Self::None, _) | (_, Self::None) => false,
+            (Self::I16(_), Self::I32(_)) | (Self::I32(_), Self::I16(_)) => {
+                (0..CELLS * CELLS).all(|i| self.get(i) == other.get(i))
+            }
+        }
+    }
+}
+
+impl Eq for TileSurface {}
+
+impl TileColumns {
+    /// Shared empty 16x16 stand-in tile (zero heap bytes for spans, offsets, or surface).
+    pub(crate) fn empty() -> Arc<Self> {
+        static EMPTY: std::sync::OnceLock<Arc<TileColumns>> = std::sync::OnceLock::new();
+        EMPTY
+            .get_or_init(|| {
+                Arc::new(Self {
+                    spans: Vec::new(),
+                    offsets: SpanOffsets::Empty(CELLS * CELLS),
+                    surface: TileSurface::None,
+                })
+            })
+            .clone()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match &self.offsets {
+            SpanOffsets::Empty(len) => *len,
+            SpanOffsets::U16(o) => o.len().saturating_sub(1),
+            SpanOffsets::U32(o) => o.len().saturating_sub(1),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn spans(&self, index: usize) -> &[Span] {
+        match &self.offsets {
+            SpanOffsets::Empty(_) => &[],
+            SpanOffsets::U16(o) => &self.spans[usize::from(o[index])..usize::from(o[index + 1])],
+            SpanOffsets::U32(o) => &self.spans[o[index] as usize..o[index + 1] as usize],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn surface(&self, index: usize) -> Option<Surface> {
+        self.surface.get(index)
+    }
+
+    pub(crate) fn is_empty_column(&self, index: usize) -> bool {
+        self.spans(index).is_empty() && self.surface(index).is_none()
+    }
+
+    fn column_matches(&self, index: usize, spans: &[Span], surface: Option<Surface>) -> bool {
+        self.spans(index) == spans && self.surface(index) == surface
+    }
+
+    /// Replaces one cell's spans in place and clears its surface metadata,
+    /// avoiding a full 256-cell rebuild on unshared single-cell detail updates.
+    fn patch_cell_no_surface(&mut self, index: usize, new_spans: &[Span]) {
+        self.surface.clear_cell(index);
+        match &mut self.offsets {
+            SpanOffsets::Empty(len) => {
+                if !new_spans.is_empty() {
+                    let len = *len;
+                    self.spans.extend_from_slice(new_spans);
+                    let new_len = new_spans.len();
+                    if new_len <= usize::from(u16::MAX) {
+                        let mut offsets = vec![0u16; len + 1];
+                        offsets[index + 1..].fill(new_len as u16);
+                        self.offsets = SpanOffsets::U16(offsets.into_boxed_slice());
+                    } else {
+                        let mut offsets = vec![0u32; len + 1];
+                        offsets[index + 1..].fill(new_len as u32);
+                        self.offsets = SpanOffsets::U32(offsets.into_boxed_slice());
+                    }
+                }
+            }
+            SpanOffsets::U16(o) => {
+                let start = usize::from(o[index]);
+                let end = usize::from(o[index + 1]);
+                let old_len = end - start;
+                let new_len = new_spans.len();
+                if new_len == old_len {
+                    self.spans[start..end].copy_from_slice(new_spans);
+                    return;
+                }
+                let new_total = self.spans.len() - old_len + new_len;
+                self.spans.splice(start..end, new_spans.iter().copied());
+                if new_total == 0 {
+                    let len = o.len().saturating_sub(1);
+                    self.offsets = SpanOffsets::Empty(len);
+                } else if new_total <= usize::from(u16::MAX) {
+                    if new_len > old_len {
+                        let diff = (new_len - old_len) as u16;
+                        for v in &mut o[index + 1..] {
+                            *v += diff;
+                        }
+                    } else {
+                        let diff = (old_len - new_len) as u16;
+                        for v in &mut o[index + 1..] {
+                            *v -= diff;
+                        }
+                    }
+                } else {
+                    let diff = (new_len - old_len) as u32;
+                    let mut upgraded: Vec<u32> = o.iter().map(|&v| u32::from(v)).collect();
+                    for v in &mut upgraded[index + 1..] {
+                        *v += diff;
+                    }
+                    self.offsets = SpanOffsets::U32(upgraded.into_boxed_slice());
+                }
+            }
+            SpanOffsets::U32(o) => {
+                let start = o[index] as usize;
+                let end = o[index + 1] as usize;
+                let old_len = end - start;
+                let new_len = new_spans.len();
+                if new_len == old_len {
+                    self.spans[start..end].copy_from_slice(new_spans);
+                    return;
+                }
+                let new_total = self.spans.len() - old_len + new_len;
+                self.spans.splice(start..end, new_spans.iter().copied());
+                if new_total == 0 {
+                    let len = o.len().saturating_sub(1);
+                    self.offsets = SpanOffsets::Empty(len);
+                } else if new_total <= usize::from(u16::MAX) {
+                    let diff = (old_len - new_len) as u32;
+                    let mut narrowed = Vec::with_capacity(o.len());
+                    narrowed.extend(o[..=index].iter().map(|&v| v as u16));
+                    narrowed.extend(o[index + 1..].iter().map(|&v| (v - diff) as u16));
+                    self.offsets = SpanOffsets::U16(narrowed.into_boxed_slice());
+                } else if new_len > old_len {
+                    let diff = (new_len - old_len) as u32;
+                    for v in &mut o[index + 1..] {
+                        *v += diff;
+                    }
+                } else {
+                    let diff = (old_len - new_len) as u32;
+                    for v in &mut o[index + 1..] {
+                        *v -= diff;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn filled(column: &Column) -> Self {
+        Self::from_cells(CELLS * CELLS, |_| (column.spans.as_slice(), column.surface))
+    }
+
+    pub(crate) fn from_columns(columns: &[Column]) -> Self {
+        Self::from_cells(columns.len(), |i| {
+            let col = &columns[i];
+            (col.spans.as_slice(), col.surface)
+        })
+    }
+
+    fn from_cells<'a>(len: usize, get: impl Fn(usize) -> (&'a [Span], Option<Surface>)) -> Self {
+        let mut total_spans = 0usize;
+        let mut any_surface = false;
+        let mut needs_i32 = false;
+        let mut water_state: Option<BlockStateId> = None;
+        let mut mixed_water = false;
+        for i in 0..len {
+            let (spans, surface) = get(i);
+            total_spans += spans.len();
+            if let Some(surface) = surface {
+                any_surface = true;
+                if i16::try_from(surface.height).is_err()
+                    || surface
+                        .water
+                        .is_some_and(|(h, _)| i16::try_from(h).is_err())
+                {
+                    needs_i32 = true;
+                }
+                if let Some((_, state)) = surface.water {
+                    match water_state {
+                        None => water_state = Some(state),
+                        Some(prev) if prev != state => mixed_water = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let mut spans = Vec::with_capacity(total_spans);
+        let mut offsets_u16 = if total_spans > 0 && total_spans <= usize::from(u16::MAX) {
+            let mut v = Vec::with_capacity(len + 1);
+            v.push(0u16);
+            Some(v)
+        } else {
+            None
+        };
+        let mut offsets_u32 = if total_spans > usize::from(u16::MAX) {
+            let mut v = Vec::with_capacity(len + 1);
+            v.push(0u32);
+            Some(v)
+        } else {
+            None
+        };
+        let mut surface = if !any_surface || len > CELLS * CELLS {
+            debug_assert!(!any_surface || len <= CELLS * CELLS);
+            TileSurface::None
+        } else if needs_i32 {
+            TileSurface::I32(Box::new(TileSurface32 {
+                present: [0; 4],
+                heights: [0; CELLS * CELLS],
+                states: [BlockStateId(0); CELLS * CELLS],
+                biomes: [0; CELLS * CELLS],
+                water_present: [0; 4],
+                water: water_state.map(|_| {
+                    Box::new(TileWater32 {
+                        heights: [0; CELLS * CELLS],
+                        states: [BlockStateId(0); CELLS * CELLS],
+                    })
+                }),
+            }))
+        } else {
+            let water = match (water_state, mixed_water) {
+                (None, _) => TileWater16::None,
+                (Some(state), false) => TileWater16::Uniform {
+                    present: [0; 4],
+                    state,
+                    heights: Box::new([0; CELLS * CELLS]),
+                },
+                (Some(_), true) => TileWater16::Mixed {
+                    present: [0; 4],
+                    heights: Box::new([0; CELLS * CELLS]),
+                    states: Box::new([BlockStateId(0); CELLS * CELLS]),
+                },
+            };
+            TileSurface::I16(Box::new(TileSurface16 {
+                present: [0; 4],
+                heights: [0; CELLS * CELLS],
+                states: [BlockStateId(0); CELLS * CELLS],
+                biomes: [0; CELLS * CELLS],
+                water,
+            }))
+        };
+        for i in 0..len {
+            let (col_spans, col_surface) = get(i);
+            spans.extend_from_slice(col_spans);
+            if let Some(o) = &mut offsets_u16 {
+                o.push(spans.len() as u16);
+            } else if let Some(o) = &mut offsets_u32 {
+                o.push(spans.len() as u32);
+            }
+            if let Some(col_surface) = col_surface {
+                let word = i / 64;
+                let bit = 1u64 << (i % 64);
+                match &mut surface {
+                    TileSurface::I16(s) => {
+                        s.present[word] |= bit;
+                        s.heights[i] = col_surface.height as i16;
+                        s.states[i] = col_surface.state;
+                        s.biomes[i] = col_surface.biome;
+                        if let Some((wh, ws)) = col_surface.water {
+                            match &mut s.water {
+                                TileWater16::Uniform {
+                                    present, heights, ..
+                                } => {
+                                    present[word] |= bit;
+                                    heights[i] = wh as i16;
+                                }
+                                TileWater16::Mixed {
+                                    present,
+                                    heights,
+                                    states,
+                                } => {
+                                    present[word] |= bit;
+                                    heights[i] = wh as i16;
+                                    states[i] = ws;
+                                }
+                                TileWater16::None => unreachable!(),
+                            }
+                        }
+                    }
+                    TileSurface::I32(s) => {
+                        s.present[word] |= bit;
+                        s.heights[i] = col_surface.height;
+                        s.states[i] = col_surface.state;
+                        s.biomes[i] = col_surface.biome;
+                        if let Some((wh, ws)) = col_surface.water {
+                            s.water_present[word] |= bit;
+                            if let Some(w) = &mut s.water {
+                                w.heights[i] = wh;
+                                w.states[i] = ws;
+                            }
+                        }
+                    }
+                    TileSurface::None => {}
+                }
+            }
+        }
+        let offsets = if let Some(o) = offsets_u16 {
+            SpanOffsets::U16(o.into_boxed_slice())
+        } else if let Some(o) = offsets_u32 {
+            SpanOffsets::U32(o.into_boxed_slice())
+        } else {
+            SpanOffsets::Empty(len)
+        };
+        Self {
+            spans,
+            offsets,
+            surface,
+        }
+    }
+
+    fn from_raw(mut spans: Vec<Span>, offsets: Vec<u32>, surface: TileSurface) -> Self {
+        let len = offsets.len().saturating_sub(1);
+        let offsets = if spans.is_empty() {
+            SpanOffsets::Empty(len)
+        } else if spans.len() <= usize::from(u16::MAX) {
+            SpanOffsets::U16(offsets.into_iter().map(|o| o as u16).collect())
+        } else {
+            SpanOffsets::U32(offsets.into_boxed_slice())
+        };
+        spans.shrink_to_fit();
+        Self {
+            spans,
+            offsets,
+            surface,
+        }
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.spans.capacity() * std::mem::size_of::<Span>()
+            + match &self.offsets {
+                SpanOffsets::Empty(_) => 0,
+                SpanOffsets::U16(o) => std::mem::size_of_val(o.as_ref()),
+                SpanOffsets::U32(o) => std::mem::size_of_val(o.as_ref()),
+            }
+            + self.surface.heap_bytes()
+    }
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Column {
+    pub surface: Option<Surface>,
+    pub spans: Spans,
+}
+impl Column {
+    /// Reduce an entire horizontal footprint, rather than inflating its corner
+    /// column. A height is drawn where any column of the footprint holds a
+    /// block there, in the material most of them hold: anything joined to
+    /// the ground stays joined at every width. Drawing only heights most of
+    /// the footprint held dropped trunks (one column of 16 or 256) under the
+    /// crowns they hold up, and the crowns hung in the air as slabs.
+    pub fn reduced(columns: &[Column; 256], x: usize, z: usize, width: usize) -> Self {
+        if width == 1 {
+            return columns[z * 16 + x].clone();
+        }
+        let mut spans = Spans::new();
+        reduce_spans_into(
+            |dx, dz| columns[dz * 16 + dx].spans.as_slice(),
+            x,
+            z,
+            width,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut spans,
+        );
+        Self {
+            surface: None,
+            spans,
+        }
+    }
+    pub fn from_surface(surface: Option<Surface>) -> Self {
+        let mut column = Self {
+            surface,
+            spans: Spans::new(),
+        };
+        if let Some(s) = surface {
+            if s.height > MIN_Y {
+                column.spans.push(Span {
+                    min: MIN_Y as i16,
+                    max: s.height as i16,
+                    state: s.state,
+                    biome: s.biome,
+                    light: 240,
+                });
+            }
+            if let Some((height, state)) = s.water {
+                column.spans.push(Span {
+                    min: s.height as i16,
+                    max: height as i16,
+                    state,
+                    biome: s.biome,
+                    light: 240,
+                });
+            }
+        }
+        column
+    }
+    #[inline]
+    pub fn push(&mut self, span: Span) {
+        if let Some(last) = self.spans.last_mut()
+            && last.max == span.min
+            && last.state == span.state
+            && last.biome == span.biome
+            && last.light == span.light
+        {
+            last.max = span.max;
+        } else {
+            self.spans.push(span);
+        }
+    }
+    /// `kinds`: `state_kinds`, per block state; `water`: `water_source(kinds)`,
+    /// what blocks holding water (kelp, seagrass, waterlogged ones) are drawn as.
+    #[cfg(test)]
+    fn from_chunk(
+        chunk: &Chunk,
+        kinds: &[u8],
+        water: Option<BlockStateId>,
+        x: i32,
+        z: i32,
+    ) -> Self {
+        let kind = |state: BlockStateId| kinds.get(state.0 as usize).copied().unwrap_or(0);
+        let face_light = |y: i32| {
+            let mut sky = 0;
+            let mut block = 0;
+            for (dx, dy, dz) in [
+                (0, 0, 0),
+                (-1, 0, 0),
+                (1, 0, 0),
+                (0, -1, 0),
+                (0, 1, 0),
+                (0, 0, -1),
+                (0, 0, 1),
+            ] {
+                if !(0..16).contains(&(x + dx)) || !(0..16).contains(&(z + dz)) {
+                    continue;
+                }
+                let value = chunk.light(x + dx, y + dy, z + dz);
+                sky = sky.max(value & 0xf0);
+                block = block.max(value & 15);
+            }
+            sky | block
+        };
+        let mut column = Self::default();
+        for (sy, section) in chunk.sections.iter().enumerate() {
+            let min = chunk.min_y() + sy as i32 * 16;
+            let uniform = section.blocks.bits() == 0
+                && section.biomes.bits() == 0
+                && matches!(section.light, crate::chunk::Light::Uniform(_));
+            let uniform = uniform
+                && face_light(min) == chunk.light(x, min, z)
+                && face_light(min + 15) == chunk.light(x, min, z);
+            let step = if uniform { 16 } else { 1 };
+            for offset in (0..16).step_by(step) {
+                let y = min + offset;
+                let mut state = BlockStateId(chunk.get(x, y, z));
+                let mut kind = kind(state);
+                if kind & KEPT == 0 {
+                    continue;
+                }
+                if kind & WATERY != 0
+                    && let Some(water) = water
+                {
+                    state = water;
+                    kind = kinds[water.0 as usize];
+                }
+                let light = face_light(y);
+                column.push(Span {
+                    min: y as i16,
+                    max: (y + step as i32) as i16,
+                    state,
+                    biome: chunk.biome(x, y, z),
+                    light: u16::from(light & 0xf0) | (u16::from((light & 15).max(kind >> 4)) << 12),
+                });
+            }
+        }
+        let mut water = None;
+        for span in column.spans.iter().rev() {
+            if kind(span.state) & FLUID != 0 {
+                water.get_or_insert((i32::from(span.max), span.state));
+            } else {
+                column.surface = Some(Surface {
+                    height: i32::from(span.max),
+                    state: span.state,
+                    water,
+                    biome: span.biome,
+                });
+                break;
+            }
+        }
+        if column.surface.is_none()
+            && let Some((height, state)) = water
+        {
+            column.surface = Some(Surface {
+                height: chunk.min_y(),
+                state: BlockStateId(
+                    kinds.iter().position(|&kind| kind & AIR != 0).unwrap_or(0) as u32
+                ),
+                water: Some((height, state)),
+                biome: chunk.biome(x, height - 1, z),
+            });
+        }
+        column
+    }
+}
+const IDENTITY_256: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = i as u8;
+        i += 1;
+    }
+    table
+};
+
+#[derive(Clone, Copy)]
+enum BoundaryLight<'a> {
+    Uniform(u8),
+    Slice(&'a [u8; 256]),
+}
+
+impl BoundaryLight<'_> {
+    #[inline(always)]
+    fn get(self, col: usize) -> u8 {
+        match self {
+            Self::Uniform(v) => v,
+            Self::Slice(slice) => slice[col],
+        }
+    }
+}
+
+enum SectionBlocks {
+    Empty,
+    Uniform { state: BlockStateId, emission: u8 },
+    Paletted,
+    Global,
+}
+
+#[inline(always)]
+fn kind_of(kinds: &[u8], state: u32) -> u8 {
+    kinds.get(state as usize).copied().unwrap_or(0)
+}
+
+#[inline(always)]
+fn resolve_kept(raw: u32, kinds: &[u8], water: Option<BlockStateId>) -> Option<(BlockStateId, u8)> {
+    let mut state = BlockStateId(raw);
+    let mut k = kind_of(kinds, raw);
+    if k & KEPT == 0 {
+        return None;
+    }
+    if k & WATERY != 0
+        && let Some(water) = water
+    {
+        state = water;
+        k = kinds[water.0 as usize];
+    }
+    Some((state, k >> 4))
+}
+
+#[inline(always)]
+fn max_light(a: u8, b: u8) -> u8 {
+    (a & 0xf0).max(b & 0xf0) | (a & 0x0f).max(b & 0x0f)
+}
+
+#[inline(always)]
+fn pack_span_light(light: u8, emission: u8) -> u16 {
+    u16::from(light & 0xf0) | (u16::from((light & 15).max(emission)) << 12)
+}
+
+#[inline(always)]
+fn face_light_at(
+    cur_layer: &[u8; 256],
+    down_layer: &[u8; 256],
+    up_layer: &[u8; 256],
+    x: usize,
+    z: usize,
+    col: usize,
+) -> u8 {
+    let mut light = cur_layer[col];
+    light = max_light(light, down_layer[col]);
+    light = max_light(light, up_layer[col]);
+    if x > 0 {
+        light = max_light(light, cur_layer[col - 1]);
+    }
+    if x < 15 {
+        light = max_light(light, cur_layer[col + 1]);
+    }
+    if z > 0 {
+        light = max_light(light, cur_layer[col - 16]);
+    }
+    if z < 15 {
+        light = max_light(light, cur_layer[col + 16]);
+    }
+    light
+}
+
+#[inline]
+fn unpack_section_light<'a>(
+    light: &'a crate::chunk::Light,
+    buf: &'a mut [u8; 4096],
+) -> &'a [u8; 4096] {
+    match light {
+        crate::chunk::Light::Full(a) => a,
+        other => {
+            other.copy_run(0, buf);
+            buf
+        }
+    }
+}
+
+#[inline]
+fn below_boundary<'a>(chunk: &'a Chunk, sy: usize, buf: &'a mut [u8; 256]) -> BoundaryLight<'a> {
+    if sy == 0 {
+        BoundaryLight::Uniform(0)
+    } else {
+        match &chunk.sections[sy - 1].light {
+            crate::chunk::Light::Uniform(v) => BoundaryLight::Uniform(*v),
+            crate::chunk::Light::Full(a) => BoundaryLight::Slice(&a.as_chunks::<256>().0[15]),
+            light => {
+                light.copy_run(15 << 8, buf);
+                BoundaryLight::Slice(buf)
+            }
+        }
+    }
+}
+
+#[inline]
+fn above_boundary<'a>(chunk: &'a Chunk, sy: usize, buf: &'a mut [u8; 256]) -> BoundaryLight<'a> {
+    if sy + 1 >= chunk.sections.len() {
+        BoundaryLight::Uniform(0xF0)
+    } else {
+        match &chunk.sections[sy + 1].light {
+            crate::chunk::Light::Uniform(v) => BoundaryLight::Uniform(*v),
+            crate::chunk::Light::Full(a) => BoundaryLight::Slice(&a.as_chunks::<256>().0[0]),
+            light => {
+                light.copy_run(0, buf);
+                BoundaryLight::Slice(buf)
+            }
+        }
+    }
+}
+
+#[inline]
+fn below_light_slice<'a>(chunk: &'a Chunk, sy: usize, buf: &'a mut [u8; 256]) -> &'a [u8; 256] {
+    if sy == 0 {
+        buf.fill(0);
+        buf
+    } else {
+        match &chunk.sections[sy - 1].light {
+            crate::chunk::Light::Full(a) => &a.as_chunks::<256>().0[15],
+            light => {
+                light.copy_run(15 << 8, buf);
+                buf
+            }
+        }
+    }
+}
+
+#[inline]
+fn above_light_slice<'a>(chunk: &'a Chunk, sy: usize, buf: &'a mut [u8; 256]) -> &'a [u8; 256] {
+    if sy + 1 >= chunk.sections.len() {
+        buf.fill(0xF0);
+        buf
+    } else {
+        match &chunk.sections[sy + 1].light {
+            crate::chunk::Light::Full(a) => &a.as_chunks::<256>().0[0],
+            light => {
+                light.copy_run(0, buf);
+                buf
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn push_uniform_column(
+    column: &mut Column,
+    min: i32,
+    state: BlockStateId,
+    biome: u16,
+    lights: [u16; 3],
+) {
+    let [l0, lm, l15] = lights;
+    let span = |a: i32, b: i32, light: u16| Span {
+        min: a as i16,
+        max: b as i16,
+        state,
+        biome,
+        light,
+    };
+    if l0 == lm && l15 == lm {
+        column.push(span(min, min + 16, lm));
+    } else {
+        column.push(span(min, min + 1, l0));
+        column.push(span(min + 1, min + 15, lm));
+        column.push(span(min + 15, min + 16, l15));
+    }
+}
+
+#[inline(always)]
+fn sweep_uniform_light(
+    columns: &mut [Column; 256],
+    min: i32,
+    biomes: &[u32; 64],
+    v: u8,
+    bounds: [BoundaryLight<'_>; 2],
+    mut resolve: impl FnMut(usize, usize) -> Option<(BlockStateId, u8)>,
+) {
+    let [below, above] = bounds;
+    for dy in 0..16usize {
+        let biome_y = (dy >> 2) << 4;
+        let y = (min + dy as i32) as i16;
+        let y_next = (min + dy as i32 + 1) as i16;
+        let boundary = match dy {
+            0 => below,
+            15 => above,
+            _ => BoundaryLight::Uniform(v),
+        };
+        match boundary {
+            BoundaryLight::Uniform(b) => {
+                let face = max_light(v, b);
+                for (col, column) in columns.iter_mut().enumerate() {
+                    let Some((state, emission)) = resolve(dy, col) else {
+                        continue;
+                    };
+                    let biome = biomes[biome_y | ((col >> 6) << 2) | ((col & 15) >> 2)] as u16;
+                    column.push(Span {
+                        min: y,
+                        max: y_next,
+                        state,
+                        biome,
+                        light: pack_span_light(face, emission),
+                    });
+                }
+            }
+            BoundaryLight::Slice(b) => {
+                for (col, column) in columns.iter_mut().enumerate() {
+                    let Some((state, emission)) = resolve(dy, col) else {
+                        continue;
+                    };
+                    let face = max_light(v, b[col]);
+                    let biome = biomes[biome_y | ((col >> 6) << 2) | ((col & 15) >> 2)] as u16;
+                    column.push(Span {
+                        min: y,
+                        max: y_next,
+                        state,
+                        biome,
+                        light: pack_span_light(face, emission),
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn sweep_nonuniform_light(
+    columns: &mut [Column; 256],
+    min: i32,
+    biomes: &[u32; 64],
+    light_layers: &[[u8; 256]],
+    bounds: [&[u8; 256]; 2],
+    mut resolve: impl FnMut(usize, usize) -> Option<(BlockStateId, u8)>,
+) {
+    let [below, above] = bounds;
+    for dy in 0..16usize {
+        let cur_layer = &light_layers[dy];
+        let down_layer = if dy == 0 {
+            below
+        } else {
+            &light_layers[dy - 1]
+        };
+        let up_layer = if dy == 15 {
+            above
+        } else {
+            &light_layers[dy + 1]
+        };
+        let biome_y = (dy >> 2) << 4;
+        let y = (min + dy as i32) as i16;
+        let y_next = (min + dy as i32 + 1) as i16;
+        for z in 0..16usize {
+            let row = z << 4;
+            let biome_yz = biome_y | ((z >> 2) << 2);
+            for x in 0..16usize {
+                let col = row | x;
+                let Some((state, emission)) = resolve(dy, col) else {
+                    continue;
+                };
+                let face = face_light_at(cur_layer, down_layer, up_layer, x, z, col);
+                columns[col].push(Span {
+                    min: y,
+                    max: y_next,
+                    state,
+                    biome: biomes[biome_yz | (x >> 2)] as u16,
+                    light: pack_span_light(face, emission),
+                });
+            }
+        }
+    }
+}
+
+#[inline(never)]
+fn summarize_global_section(
+    chunk: &Chunk,
+    sy: usize,
+    kinds: &[u8],
+    water: Option<BlockStateId>,
+    columns: &mut [Column; 256],
+) {
+    let section = &chunk.sections[sy];
+    let min = chunk.min_y() + sy as i32 * 16;
+    let mut blocks = [0u32; 4096];
+    let mut biomes = [0u32; 64];
+    let mut below_buf = [0u8; 256];
+    let mut above_buf = [0u8; 256];
+    section.blocks.unpack(&mut blocks);
+    section.biomes.unpack(&mut biomes);
+    let block_layers = blocks.as_chunks::<256>().0;
+    if let crate::chunk::Light::Uniform(v) = section.light {
+        let below = below_boundary(chunk, sy, &mut below_buf);
+        let above = above_boundary(chunk, sy, &mut above_buf);
+        sweep_uniform_light(columns, min, &biomes, v, [below, above], |dy, col| {
+            resolve_kept(block_layers[dy][col], kinds, water)
+        });
+    } else {
+        let mut light_buf = [0u8; 4096];
+        let light_slice = unpack_section_light(&section.light, &mut light_buf);
+        let below = below_light_slice(chunk, sy, &mut below_buf);
+        let above = above_light_slice(chunk, sy, &mut above_buf);
+        let light_layers = light_slice.as_chunks::<256>().0;
+        sweep_nonuniform_light(
+            columns,
+            min,
+            &biomes,
+            light_layers,
+            [below, above],
+            |dy, col| resolve_kept(block_layers[dy][col], kinds, water),
+        );
+    }
+}
+
+/// A chunk's 256 columns, summarized section by section on the far-terrain worker.
+pub(crate) fn summarize(chunk: &Chunk, kinds: &[u8]) -> Arc<[Column; 256]> {
+    let water = water_source(kinds);
+    let mut columns: [Column; 256] = std::array::from_fn(|_| Column::default());
+    let mut pal_state = [BlockStateId(0); 256];
+    let mut pal_kept_emission = [0u8; 256];
+    let mut ids = [0u8; 4096];
+    let mut biomes = [0u32; 64];
+    let mut light_buf = [0u8; 4096];
+    let mut below_buf = [0u8; 256];
+    let mut above_buf = [0u8; 256];
+
+    let min_y = chunk.min_y();
+    for (sy, section) in chunk.sections.iter().enumerate() {
+        let min = min_y + sy as i32 * 16;
+        let section_blocks = if section.blocks.bits() == 0 {
+            match resolve_kept(section.blocks.get(0), kinds, water) {
+                Some((state, emission)) => SectionBlocks::Uniform { state, emission },
+                None => SectionBlocks::Empty,
+            }
+        } else if let Some(palette) = section.blocks.palette()
+            && section.blocks.bits() <= 8
+            && palette.len() <= 256
+        {
+            let mut any_kept = false;
+            let mut all_same = true;
+            let mut first_kept: Option<(BlockStateId, u8)> = None;
+            for (i, &raw) in palette.iter().enumerate() {
+                if let Some((state, emission)) = resolve_kept(raw, kinds, water) {
+                    any_kept = true;
+                    pal_state[i] = state;
+                    pal_kept_emission[i] = (emission << 4) | KEPT;
+                    match first_kept {
+                        None => first_kept = Some((state, emission)),
+                        Some(first) if first != (state, emission) => all_same = false,
+                        _ => {}
+                    }
+                } else {
+                    pal_kept_emission[i] = 0;
+                    all_same = false;
+                }
+            }
+            if !any_kept {
+                SectionBlocks::Empty
+            } else if all_same && let Some((state, emission)) = first_kept {
+                SectionBlocks::Uniform { state, emission }
+            } else if let Some(raw) = section.blocks.uniform() {
+                match resolve_kept(raw, kinds, water) {
+                    Some((state, emission)) => SectionBlocks::Uniform { state, emission },
+                    None => SectionBlocks::Empty,
+                }
+            } else {
+                SectionBlocks::Paletted
+            }
+        } else if let Some(raw) = section.blocks.uniform() {
+            match resolve_kept(raw, kinds, water) {
+                Some((state, emission)) => SectionBlocks::Uniform { state, emission },
+                None => SectionBlocks::Empty,
+            }
+        } else {
+            SectionBlocks::Global
+        };
+
+        match section_blocks {
+            SectionBlocks::Empty => continue,
+            SectionBlocks::Uniform { state, emission } => {
+                if let crate::chunk::Light::Uniform(v) = section.light {
+                    let below = below_boundary(chunk, sy, &mut below_buf);
+                    let above = above_boundary(chunk, sy, &mut above_buf);
+                    let lm = pack_span_light(v, emission);
+                    if let Some(biome) = section.biomes.uniform() {
+                        let biome = biome as u16;
+                        match (below, above) {
+                            (BoundaryLight::Uniform(b), BoundaryLight::Uniform(a)) => {
+                                let l0 = pack_span_light(max_light(v, b), emission);
+                                let l15 = pack_span_light(max_light(v, a), emission);
+                                if l0 == lm && l15 == lm {
+                                    let span = Span {
+                                        min: min as i16,
+                                        max: (min + 16) as i16,
+                                        state,
+                                        biome,
+                                        light: lm,
+                                    };
+                                    for column in &mut columns {
+                                        column.push(span);
+                                    }
+                                } else {
+                                    for column in &mut columns {
+                                        push_uniform_column(
+                                            column,
+                                            min,
+                                            state,
+                                            biome,
+                                            [l0, lm, l15],
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                for (col, column) in columns.iter_mut().enumerate() {
+                                    let l0 =
+                                        pack_span_light(max_light(v, below.get(col)), emission);
+                                    let l15 =
+                                        pack_span_light(max_light(v, above.get(col)), emission);
+                                    push_uniform_column(column, min, state, biome, [l0, lm, l15]);
+                                }
+                            }
+                        }
+                    } else {
+                        section.biomes.unpack(&mut biomes);
+                        for (col, column) in columns.iter_mut().enumerate() {
+                            let l0 = pack_span_light(max_light(v, below.get(col)), emission);
+                            let l15 = pack_span_light(max_light(v, above.get(col)), emission);
+                            let bcol = ((col >> 6) << 2) | ((col & 15) >> 2);
+                            let b = [
+                                biomes[bcol] as u16,
+                                biomes[16 | bcol] as u16,
+                                biomes[32 | bcol] as u16,
+                                biomes[48 | bcol] as u16,
+                            ];
+                            for (a, end, biome, light) in [
+                                (0, 1, b[0], l0),
+                                (1, 4, b[0], lm),
+                                (4, 8, b[1], lm),
+                                (8, 12, b[2], lm),
+                                (12, 15, b[3], lm),
+                                (15, 16, b[3], l15),
+                            ] {
+                                column.push(Span {
+                                    min: (min + a) as i16,
+                                    max: (min + end) as i16,
+                                    state,
+                                    biome,
+                                    light,
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    section.biomes.unpack(&mut biomes);
+                    let light_slice = unpack_section_light(&section.light, &mut light_buf);
+                    let below = below_light_slice(chunk, sy, &mut below_buf);
+                    let above = above_light_slice(chunk, sy, &mut above_buf);
+                    let light_layers = light_slice.as_chunks::<256>().0;
+                    sweep_nonuniform_light(
+                        &mut columns,
+                        min,
+                        &biomes,
+                        light_layers,
+                        [below, above],
+                        |_, _| Some((state, emission)),
+                    );
+                }
+            }
+            SectionBlocks::Paletted => {
+                section.blocks.unpack_ids_mapped(&mut ids, &IDENTITY_256);
+                section.biomes.unpack(&mut biomes);
+                let id_layers = ids.as_chunks::<256>().0;
+                if let crate::chunk::Light::Uniform(v) = section.light {
+                    let below = below_boundary(chunk, sy, &mut below_buf);
+                    let above = above_boundary(chunk, sy, &mut above_buf);
+                    sweep_uniform_light(
+                        &mut columns,
+                        min,
+                        &biomes,
+                        v,
+                        [below, above],
+                        |dy, col| {
+                            let pid = usize::from(id_layers[dy][col]);
+                            let ke = pal_kept_emission[pid];
+                            if ke == 0 {
+                                None
+                            } else {
+                                Some((pal_state[pid], ke >> 4))
+                            }
+                        },
+                    );
+                } else {
+                    let light_slice = unpack_section_light(&section.light, &mut light_buf);
+                    let below = below_light_slice(chunk, sy, &mut below_buf);
+                    let above = above_light_slice(chunk, sy, &mut above_buf);
+                    let light_layers = light_slice.as_chunks::<256>().0;
+                    sweep_nonuniform_light(
+                        &mut columns,
+                        min,
+                        &biomes,
+                        light_layers,
+                        [below, above],
+                        |dy, col| {
+                            let pid = usize::from(id_layers[dy][col]);
+                            let ke = pal_kept_emission[pid];
+                            if ke == 0 {
+                                None
+                            } else {
+                                Some((pal_state[pid], ke >> 4))
+                            }
+                        },
+                    );
+                }
+            }
+            SectionBlocks::Global => {
+                summarize_global_section(chunk, sy, kinds, water, &mut columns);
+            }
+        }
+    }
+
+    let mut air_state = None;
+    for (col, column) in columns.iter_mut().enumerate() {
+        let mut top_water = None;
+        for span in column.spans.iter().rev() {
+            if kind_of(kinds, span.state.0) & FLUID != 0 {
+                top_water.get_or_insert((i32::from(span.max), span.state));
+            } else {
+                column.surface = Some(Surface {
+                    height: i32::from(span.max),
+                    state: span.state,
+                    water: top_water,
+                    biome: span.biome,
+                });
+                break;
+            }
+        }
+        if column.surface.is_none()
+            && let Some((height, state)) = top_water
+        {
+            let air = *air_state.get_or_insert_with(|| {
+                BlockStateId(kinds.iter().position(|&k| k & AIR != 0).unwrap_or(0) as u32)
+            });
+            column.surface = Some(Surface {
+                height: min_y,
+                state: air,
+                water: Some((height, state)),
+                biome: chunk.biome((col & 15) as i32, height - 1, (col >> 4) as i32),
+            });
+        }
+    }
+    Arc::new(columns)
+}
+/// The water source state: the first plain kept fluid without light
+/// (`minecraft:water` comes before lava, and its level 0 first).
+fn water_source(kinds: &[u8]) -> Option<BlockStateId> {
+    kinds
+        .iter()
+        .position(|&kind| kind == KEPT | FLUID)
+        .map(|i| BlockStateId(i as u32))
+}
+/// `state_kinds` bits: kept in columns, a fluid, the air state, a block
+/// holding water; the light emission is in the high nibble.
+const KEPT: u8 = 1;
+const FLUID: u8 = 2;
+const AIR: u8 = 4;
+/// A block holding water that draws as none (kelp, seagrass, bubble columns,
+/// waterlogged blocks that aren't kept): far terrain draws water there, or
+/// kelp reaching the surface leaves holes in the sea.
+const WATERY: u8 = 8;
+/// What `summarize` needs of each block state, read from the facts
+/// once: matching their names for every block made observing a chunk slow.
+pub(crate) fn state_kinds(facts: &BlockFacts) -> Vec<u8> {
+    (0..facts.states.len())
+        .map(|i| {
+            let state = BlockStateId(i as u32);
+            let f = facts.get(state);
+            let fluid = matches!(&*f.name, "minecraft:water" | "minecraft:lava");
+            // Chorus is thin and non-solid but a visible part of the far End.
+            let chorus = matches!(
+                &*f.name,
+                "minecraft:chorus_plant" | "minecraft:chorus_flower"
+            );
+            let kept = !facts.is_air(state)
+                && (f.solid_render
+                    || f.full_collision
+                    || f.name.ends_with("_leaves")
+                    || chorus
+                    || fluid
+                    || nearly_full(&f.name));
+            let watery = !kept && !facts.is_air(state) && f.fluid == crate::blocks::Fluid::Water;
+            (u8::from(kept || watery) * KEPT)
+                | (u8::from(fluid || watery) * FLUID)
+                | (u8::from(watery) * WATERY)
+                | (u8::from(state == facts.air) * AIR)
+                | (f.emission.min(15) << 4)
+        })
+        .collect()
+}
+/// Blocks that fill their cell but neither draw solid nor collide as a full
+/// block: far terrain draws them as blocks, or patches of powder snow leave
+/// holes in mountains (and paths and fields dips). Slabs use the same
+/// full-cell approximation as stairs, so distant slab builds remain visible.
+fn nearly_full(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:powder_snow"
+            | "minecraft:dirt_path"
+            | "minecraft:farmland"
+            | "minecraft:honey_block"
+    ) || name.ends_with("_stairs")
+        || name.ends_with("_slab")
+        || name.contains("fence")
+        || name.contains("_wall")
+        || name.contains("bars")
+        || name.contains("_pane")
+        || name.contains("chain")
+        || name.contains("ladder")
+}
+/// Clears the detail bits of a tile's cells whose chunk lies in `area`, but
+/// for the chunks `kept` (seen in the world): `request_detail` asks for them
+/// again.
+fn forget_detail(
+    key: TileKey,
+    area: [i32; 4],
+    mask: &mut [u64; 4],
+    kept: impl Fn((i32, i32)) -> bool,
+) {
+    let [ox, _, oz] = key.origin();
+    let stride = key.size() / 16;
+    for index in 0..256 {
+        let chunk = (
+            (ox + (index as i32 % 16) * stride).div_euclid(16),
+            (oz + (index as i32 / 16) * stride).div_euclid(16),
+        );
+        let fine = TileKey {
+            x: chunk.0,
+            z: chunk.1,
+            level: 0,
+        };
+        if fine.overlaps(area) && !kept(chunk) {
+            mask[index / 64] &= !(1 << (index % 64));
+        }
+    }
+}
+/// The tiles over `chunk` to sample again once their source keeps it
+/// (`Lod::resample_over`): those whose sample is still being taken, maybe
+/// from before, and those of cells wider than a chunk sampled empty there,
+/// which a chunk's own detail can't fill (`apply_detail`). The others hold
+/// it once `finish_detail` applies it.
+fn resampled_over(
+    ready: &FxHashMap<TileKey, Arc<TileColumns>>,
+    pending: &FxHashSet<TileKey>,
+    (cx, cz): (i32, i32),
+) -> Vec<TileKey> {
+    (1..=MAX_LEVEL)
+        .filter_map(|level| {
+            let size = 16 << level;
+            let key = TileKey {
+                x: (cx * 16).div_euclid(size),
+                z: (cz * 16).div_euclid(size),
+                level,
+            };
+            let resample = match ready.get(&key) {
+                None => pending.contains(&key),
+                Some(samples) => {
+                    let stride = size / CELLS as i32;
+                    let [ox, _, oz] = key.origin();
+                    let cell = (cz * 16 - oz) / stride * CELLS as i32 + (cx * 16 - ox) / stride;
+                    stride > 16
+                        && (pending.contains(&key)
+                            || ((cell as usize) < samples.len()
+                                && samples.is_empty_column(cell as usize)))
+                }
+            };
+            resample.then_some(key)
+        })
+        .collect()
+}
+/// [`Lod::surface`] over `ready`: the finest tile over (x, z) whose cell
+/// there holds a surface; a coarser tile answers where the finer ones are
+/// not sampled or sampled empty.
+fn surface_in(ready: &FxHashMap<TileKey, Arc<TileColumns>>, x: i32, z: i32) -> Option<Surface> {
+    (0..=MAX_LEVEL).find_map(|level| {
+        let size = 16 << level;
+        let key = TileKey {
+            x: x.div_euclid(size),
+            z: z.div_euclid(size),
+            level,
+        };
+        let columns = ready.get(&key).filter(|c| c.len() == CELLS * CELLS)?;
+        let cell = size / CELLS as i32;
+        let (cx, cz) = ((x - key.x * size) / cell, (z - key.z * size) / cell);
+        columns.surface(cz as usize * CELLS + cx as usize)
+    })
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TileKey {
+    pub x: i32,
+    pub z: i32,
+    pub level: u8,
+}
+impl TileKey {
+    pub fn size(self) -> i32 {
+        16 << self.level
+    }
+    pub fn origin(self) -> [i32; 3] {
+        [self.x * self.size(), 0, self.z * self.size()]
+    }
+    pub(crate) fn parent(self) -> Self {
+        Self {
+            x: self.x.div_euclid(2),
+            z: self.z.div_euclid(2),
+            level: self.level + 1,
+        }
+    }
+    fn children(self) -> [Self; 4] {
+        std::array::from_fn(|i| Self {
+            x: self.x * 2 + (i & 1) as i32,
+            z: self.z * 2 + (i >> 1) as i32,
+            level: self.level - 1,
+        })
+    }
+    /// The squared horizontal distance from `camera` to the tile's nearest point.
+    fn reach(self, camera: [i32; 2]) -> i64 {
+        let [x, _, z] = self.origin();
+        let gap = |c: i32, lo: i32| i64::from((lo - c).max(c - lo - self.size()).max(0));
+        gap(camera[0], x).pow(2) + gap(camera[1], z).pow(2)
+    }
+    /// Whether the tile covers any of the blocks `[x0, z0, x1, z1)`.
+    fn overlaps(self, [x0, z0, x1, z1]: [i32; 4]) -> bool {
+        let [ox, _, oz] = self.origin();
+        let size = self.size();
+        ox < x1 && oz < z1 && ox + size > x0 && oz + size > z0
+    }
+    /// Whether new data for `area` drawn in cells `widths` wide changes the
+    /// tile's samples: its cells are that wide, and it covers `area` or the
+    /// blocks around it a cell's depth reads (a block around a chunk, the
+    /// next cells' middles past one).
+    fn refreshed_by(self, area: [i32; 4], widths: (i32, i32)) -> bool {
+        let cell = self.size() / CELLS as i32;
+        (widths.0..=widths.1).contains(&cell) && self.overlaps(Self::around(area, cell))
+    }
+    fn around([x0, z0, x1, z1]: [i32; 4], cell: i32) -> [i32; 4] {
+        let m = if cell <= 16 { 1 } else { cell };
+        [x0 - m, z0 - m, x1 + m, z1 + m]
+    }
+    fn distance(self, camera: [i32; 2]) -> i32 {
+        let [x, _, z] = self.origin();
+        (x - camera[0])
+            .max(camera[0] - x - self.size())
+            .max(z - camera[1])
+            .max(camera[1] - z - self.size())
+            .max(0)
+    }
+}
+#[derive(Default)]
+struct Plan {
+    roots: Vec<TileKey>,
+    nodes: Arc<FxHashSet<TileKey>>,
+    split: Arc<FxHashSet<TileKey>>,
+    /// `nodes` by level: children (level - 1) come before their parents when
+    /// selection is rebuilt, without sorting the whole set.
+    by_level: [Vec<TileKey>; MAX_LEVEL as usize + 1],
+    elevation: i32,
+    camera: [i32; 2],
+    /// The squared distance within which no coarser tile stands in for
+    /// missing detail (`stands_in`): the seam with the near chunks waits
+    /// for its own tiles instead of showing broad boxes beside them.
+    near: i64,
+    /// The squared distance within which planned tiles load before the
+    /// coarse backdrop (`wanted_tiles`).
+    first: i64,
+    /// Where a zoomed view asks for finer tiles, if it does ([`ZoomAim`]).
+    aim: Option<ZoomAim>,
+}
+/// Chunks past the render distance where only planned tiles are drawn (two
+/// past the last near chunk, `streaming::in_view_distance`), and where they
+/// load first.
+const SEAM_CHUNKS: i32 = 3;
+const FIRST_CHUNKS: i32 = 4;
+struct PlanVisit<'a> {
+    camera: [i32; 2],
+    detail: i32,
+    range: i32,
+    previous: &'a Plan,
+    reduced: bool,
+    nodes: FxHashSet<TileKey>,
+    split: FxHashSet<TileKey>,
+}
+impl Plan {
+    #[cfg(test)]
+    fn new(camera: [i32; 2], detail: i32, distance: u32) -> Self {
+        Self::with_previous(camera, detail, distance, &Self::default(), 0, false, None)
+    }
+    /// `reduced`: Reduced far detail (`graphics::FarDetail`), each level from
+    /// half the distance.
+    fn with_previous(
+        camera: [i32; 2],
+        detail: i32,
+        distance: u32,
+        previous: &Self,
+        elevation: i32,
+        reduced: bool,
+        aim: Option<ZoomAim>,
+    ) -> Self {
+        let range = distance.min(MAX_CHUNKS) as i32 * 16;
+        let mut level = 0;
+        while (16 << level) < range {
+            level += 1;
+        }
+        let size = 16 << level;
+        let mut result = Self {
+            elevation,
+            camera,
+            near: i64::from((detail + SEAM_CHUNKS) * 16).pow(2),
+            first: i64::from((detail + FIRST_CHUNKS) * 16).pow(2),
+            aim,
+            ..Self::default()
+        };
+        let mut visit = PlanVisit {
+            camera,
+            detail,
+            range,
+            previous,
+            reduced,
+            nodes: FxHashSet::default(),
+            split: FxHashSet::default(),
+        };
+        for z in (camera[1] - range).div_euclid(size)..=(camera[1] + range).div_euclid(size) {
+            for x in (camera[0] - range).div_euclid(size)..=(camera[0] + range).div_euclid(size) {
+                let key = TileKey { x, z, level };
+                result.roots.push(key);
+                result.visit(key, &mut visit);
+            }
+        }
+        result.nodes = Arc::new(visit.nodes);
+        result.split = Arc::new(visit.split);
+        result
+    }
+    fn visit(&mut self, key: TileKey, state: &mut PlanVisit<'_>) {
+        // The range is a circle, as the renderer's: a tile leaves it, and
+        // fades out (gfx/lod.rs), as the player moves.
+        if key.reach(state.camera) > i64::from(state.range) * i64::from(state.range) {
+            return;
+        }
+        if state.nodes.insert(key) {
+            self.by_level[key.level as usize].push(key);
+        }
+        // Keep distant cells small on screen; finest tiles retain individual
+        // blocks. Reduced keeps them twice as large (a quarter of the cells).
+        let held = state.previous.split.contains(&key);
+        let split = if held { 10 } else { 8 };
+        // Beyond the old 1024-chunk limit the cells are as large as `reduced`'s:
+        // the whole world is 22 levels, not all of them worth full cells.
+        let world = key.distance(state.camera) >= WORLD_START;
+        // A zoomed view magnifies the tiles its cone covers, so those split
+        // further; every other tile keeps the plan it would have had
+        // ([`ZoomAim`]). The world-wide threshold is boosted too: the horizon is
+        // where a spyglass shows the coarsest cells of all.
+        let boost = match self.aim {
+            Some(aim) if aim.covers(key, state.camera) => i64::from(aim.boost),
+            _ => 1,
+        };
+        let threshold = i64::from(key.size())
+            * i64::from(if world {
+                WORLD_SPLIT
+            } else if state.reduced {
+                split / 2
+            } else {
+                split
+            })
+            * boost;
+        // The 8 to 10 band above is wide already. The ring of full detail
+        // around the camera and the world-wide threshold have none: a tile
+        // split last plan stays split until it is 5% past them, or it
+        // flickered between two levels as the camera moved a block to and
+        // fro across the line.
+        let hold = |bound: i64| {
+            if held {
+                bound * RETURN.0 / RETURN.1
+            } else {
+                bound
+            }
+        };
+        let distance = i64::from(key.distance(state.camera));
+        if key.level > 0
+            && (distance < hold(i64::from(state.detail) * 16 + 16)
+                || distance.max(i64::from(self.elevation))
+                    < if world { hold(threshold) } else { threshold })
+        {
+            state.split.insert(key);
+            for child in key.children() {
+                self.visit(child, state);
+            }
+        }
+    }
+    #[cfg(test)]
+    fn select(
+        &self,
+        key: TileKey,
+        ready: &FxHashMap<TileKey, impl Sized>,
+        out: &mut Vec<TileKey>,
+    ) -> bool {
+        if !self.nodes.contains(&key) {
+            return true;
+        }
+        if self.split.contains(&key) {
+            // Visit every child: a missing sibling must not hide ready detail.
+            let complete = key
+                .children()
+                .into_iter()
+                .map(|child| self.select(child, ready, out))
+                .fold(true, |complete, child| complete & child);
+            if complete {
+                return true;
+            }
+            if ready.contains_key(&key) && self.stands_in(key) {
+                // Its mesh is clipped around every selected finer tile.
+                out.push(key);
+                return true;
+            }
+            false
+        } else if ready.contains_key(&key) {
+            out.push(key);
+            true
+        } else {
+            false
+        }
+    }
+    /// Whether a split tile may draw for its missing children: only away
+    /// from the near chunks, where its cells are small on screen.
+    fn stands_in(&self, key: TileKey) -> bool {
+        key.reach(self.camera) >= self.near
+    }
+    /// The coarse tile sampled to cover `leaf` while it loads: two levels
+    /// up (16 times fewer tiles, each as cheap as a leaf to sample), one
+    /// where that would reach the seam, none beside it.
+    fn backdrop(&self, leaf: TileKey) -> Option<TileKey> {
+        let mut backdrop = None;
+        let mut key = leaf;
+        for _ in 0..2 {
+            key = key.parent();
+            if !self.nodes.contains(&key) || !self.stands_in(key) {
+                break;
+            }
+            backdrop = Some(key);
+        }
+        backdrop
+    }
+    /// The finest planned leaf tile covering chunk column `(x, z)`, or `None`
+    /// if the column is outside the far plan (including under a split node
+    /// whose child there is out of range).
+    fn planned_leaf(&self, (x, z): (i32, i32)) -> Option<TileKey> {
+        (0..=MAX_LEVEL)
+            .map(|level| TileKey {
+                x: (x * 16).div_euclid(16 << level),
+                z: (z * 16).div_euclid(16 << level),
+                level,
+            })
+            .find(|key| self.nodes.contains(key))
+            .filter(|key| !self.split.contains(key))
+    }
+    /// Whether chunk column `column` lies under a planned leaf tile that can
+    /// consume a chunk summary (levels `0..=4`, where cell width is at most a
+    /// chunk).
+    fn needs_summary(&self, column: (i32, i32)) -> bool {
+        self.planned_leaf(column).is_some_and(|key| key.level <= 4)
+    }
+    /// Whether chunk column (x, z) is drawn by the tile planned there (ready;
+    /// at level 0, also `filled`) rather than by a coarser ancestor standing
+    /// in for it, or is past the far terrain.
+    fn replaces(
+        &self,
+        column: (i32, i32),
+        ready: &FxHashMap<TileKey, impl Sized>,
+        filled: impl Fn(TileKey) -> bool,
+    ) -> bool {
+        let Some(key) = self.planned_leaf(column) else {
+            return true;
+        };
+        ready.contains_key(&key) && (key.level > 0 || filled(key))
+    }
+}
+/// The tiles to sample, `Wanted`'s order best first. First the planned
+/// tiles at the seam with the near chunks, nearest first: coarse tiles
+/// there cost a far tile's work for broad boxes that fine tiles replace
+/// moments later. Then a coarse backdrop (`Plan::backdrop`) out to the
+/// horizon, then every other planned tile nearest first, each replacing its
+/// part of the backdrop: the horizon fills in early and sharpens from the
+/// player outward, whichever way they look.
+/// A tile `ready` and `stale` (`Lod::refresh`) is wanted again, its old
+/// samples drawn meanwhile: it needs no backdrop.
+fn wanted_tiles(
+    plan: &Plan,
+    ready: &FxHashMap<TileKey, impl Sized>,
+    stale: &FxHashSet<TileKey>,
+    camera: [i32; 2],
+) -> impl Iterator<Item = Wanted> {
+    let sampled = |key: &TileKey| ready.contains_key(key) && !stale.contains(key);
+    let wanted = |class, key: TileKey| Wanted {
+        class,
+        distance: i64::from(key.distance(camera)),
+        x: key.x,
+        z: key.z,
+        level: key.level,
+    };
+    let mut backdrop = FxHashSet::default();
+    let mut tiles: Vec<_> = plan
+        .nodes
+        .iter()
+        .filter(|key| !plan.split.contains(key) && !sampled(key))
+        .map(|&key| {
+            if !ready.contains_key(&key)
+                && let Some(coarse) = plan.backdrop(key)
+                && !sampled(&coarse)
+            {
+                backdrop.insert(coarse);
+            }
+            let first = key.reach(camera) < plan.first;
+            wanted(if first { SEAM } else { REST }, key)
+        })
+        .collect();
+    tiles.extend(backdrop.into_iter().map(|key| wanted(BACKDROP, key)));
+    tiles.into_iter()
+}
+/// `Wanted::class`es, best first.
+const SEAM: u8 = 0;
+const BACKDROP: u8 = 1;
+const REST: u8 = 2;
+/// Visited chunks' summaries (`Lod::saved`) and their reductions, kept in
+/// 8 by 8 chunk shards behind `Arc`s (matching `samples::Samples`):
+/// a batch's snapshot clones only the shard handles (~16 `Arc`s at
+/// `MAX_SAVED`), and an insert or eviction copies only its shard while a
+/// mesh job still reads it.
+type ChunkShard<V> = FxHashMap<(i32, i32), V>;
+struct ShardedChunks<V> {
+    shards: FxHashMap<(i32, i32), Arc<ChunkShard<V>>>,
+    len: usize,
+}
+impl<V> Default for ShardedChunks<V> {
+    fn default() -> Self {
+        Self {
+            shards: FxHashMap::default(),
+            len: 0,
+        }
+    }
+}
+impl<V> Clone for ShardedChunks<V> {
+    fn clone(&self) -> Self {
+        Self {
+            shards: self.shards.clone(),
+            len: self.len,
+        }
+    }
+}
+impl<V> ShardedChunks<V> {
+    fn shard_of((x, z): (i32, i32)) -> (i32, i32) {
+        (x >> 3, z >> 3)
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn get(&self, key: &(i32, i32)) -> Option<&V> {
+        self.shards.get(&Self::shard_of(*key))?.get(key)
+    }
+    fn contains_key(&self, key: &(i32, i32)) -> bool {
+        self.get(key).is_some()
+    }
+}
+impl<V: Clone> ShardedChunks<V> {
+    fn insert(&mut self, key: (i32, i32), value: V) -> Option<V> {
+        let shard = self.shards.entry(Self::shard_of(key)).or_default();
+        let prev = Arc::make_mut(shard).insert(key, value);
+        if prev.is_none() {
+            self.len += 1;
+        }
+        prev
+    }
+    fn remove(&mut self, key: &(i32, i32)) -> Option<V> {
+        let at = Self::shard_of(*key);
+        let shard = self.shards.get_mut(&at)?;
+        if !shard.contains_key(key) {
+            return None;
+        }
+        let prev = Arc::make_mut(shard).remove(key);
+        if prev.is_some() {
+            self.len -= 1;
+            if shard.is_empty() {
+                self.shards.remove(&at);
+            }
+        }
+        prev
+    }
+}
+impl<V> std::ops::Index<&(i32, i32)> for ShardedChunks<V> {
+    type Output = V;
+    fn index(&self, key: &(i32, i32)) -> &Self::Output {
+        self.get(key).expect("chunk entry present")
+    }
+}
+type Saved = ShardedChunks<Arc<TileColumns>>;
+type Reduced = ShardedChunks<Arc<ReducedColumns>>;
+/// What a mesh job reads, as it was when the job began: the worker gathers
+/// every tile's inputs from it (gathering on the render thread stalled the
+/// frame, tens of milliseconds for a large job on a 4-thread machine).
+struct Snapshot {
+    samples: samples::Samples,
+    saved: Saved,
+    reduced: Reduced,
+    /// The plan's tiles, to tell terrain not drawn yet from terrain out of
+    /// range (`Snapshot::planned_leaf`).
+    nodes: Arc<FxHashSet<TileKey>>,
+    split: Arc<FxHashSet<TileKey>>,
+}
+/// One column of a mesh input, by reference into the snapshot. Mesh jobs used
+/// to clone all 256 columns of a tile (each with its own span allocation);
+/// now an input is a base tile plus a handful of overrides.
+enum ColumnSource {
+    Tile(Arc<TileColumns>, u16),
+    Saved(Arc<TileColumns>, u16),
+    Reduced(Arc<ReducedColumns>, u8, u16, u16),
+    Empty,
+}
+impl ColumnSource {
+    fn get(&self) -> &[Span] {
+        match self {
+            Self::Tile(columns, index) => columns.spans(*index as usize),
+            Self::Saved(columns, index) => columns.spans(*index as usize),
+            Self::Reduced(columns, width, x, z) => {
+                columns.get(*x as usize, *z as usize, *width as usize)
+            }
+            Self::Empty => &[],
+        }
+    }
+}
+struct EdgeSource {
+    start: i32,
+    end: i32,
+    column: ColumnSource,
+    /// Planned but not drawn yet (`mesh::EdgeColumn::unknown`).
+    unknown: bool,
+}
+struct MeshInput {
+    /// The tile's samples, with `overrides` replacing some of them.
+    base: Arc<TileColumns>,
+    overrides: [Option<ColumnSource>; CELLS * CELLS],
+    neighbors: [Vec<EdgeSource>; 4],
+    finer: Vec<TileKey>,
+}
+struct ReducedColumns {
+    columns: Arc<TileColumns>,
+    /// The chunk reduced to cells 2, 4, 8 and 16 blocks wide, each built the
+    /// first time a tile of that width asks for it.
+    ///
+    /// One chunk is covered by one far tile, so one of the four is what gets
+    /// read, and a chunk whose detail arrives while full-detail terrain still
+    /// draws it reads none. Building all four up front cost 405 us of a far
+    /// terrain thread for every chunk the world sent (`Column::reduced` walks
+    /// every span of the footprint four times over), and held 85 columns
+    /// beside the chunk's 256.
+    levels: [std::sync::OnceLock<TileColumns>; 4],
+}
+impl MeshInput {
+    /// The spans of every cell: the tile's own samples unless the snapshot
+    /// has actual visited detail there.
+    fn columns(&self) -> [&[Span]; CELLS * CELLS] {
+        std::array::from_fn(|index| match &self.overrides[index] {
+            Some(source) => source.get(),
+            None => self.base.spans(index),
+        })
+    }
+    fn edges(&self) -> [Vec<mesh::EdgeColumn<'_>>; 4] {
+        std::array::from_fn(|side| {
+            self.neighbors[side]
+                .iter()
+                .map(|edge| mesh::EdgeColumn {
+                    start: edge.start,
+                    end: edge.end,
+                    spans: edge.column.get(),
+                    unknown: edge.unknown,
+                })
+                .collect()
+        })
+    }
+}
+impl ReducedColumns {
+    fn new(columns: Arc<[Column; 256]>) -> Self {
+        Self::from_tile(Arc::new(TileColumns::from_columns(columns.as_slice())))
+    }
+    fn from_tile(columns: Arc<TileColumns>) -> Self {
+        Self {
+            columns,
+            levels: std::array::from_fn(|_| std::sync::OnceLock::new()),
+        }
+    }
+    /// Builds the reduction levels whose bit is set in `levels`
+    /// (`Shared::detail_widths`), off the render thread.
+    fn warm(self, levels: u8) -> Self {
+        for level in 0..self.levels.len() {
+            if levels & (1 << level) != 0 {
+                self.level(level);
+            }
+        }
+        self
+    }
+    /// The chunk reduced to cells `2 << level` blocks wide, built once.
+    fn level(&self, level: usize) -> &TileColumns {
+        let width = 2 << level;
+        self.levels[level].get_or_init(|| {
+            // Timed on whichever thread first asks for this width, so the
+            // frame profile tells a reduction apart from the column copying
+            // around it (`Lod::apply_detail` does both).
+            crate::spans::time("lod_reduce", || {
+                let columns = &self.columns;
+                let side = 16 / width;
+                let count = side * side;
+                let mut spans = Vec::new();
+                let mut offsets = Vec::with_capacity(count + 1);
+                offsets.push(0u32);
+                let mut events = Vec::new();
+                let mut votes = Vec::new();
+                for z in 0..side {
+                    for x in 0..side {
+                        reduce_spans_into(
+                            |dx, dz| columns.spans(dz * 16 + dx),
+                            x * width,
+                            z * width,
+                            width,
+                            &mut events,
+                            &mut votes,
+                            &mut spans,
+                        );
+                        offsets.push(spans.len() as u32);
+                    }
+                }
+                TileColumns::from_raw(spans, offsets, TileSurface::None)
+            })
+        })
+    }
+    fn get(&self, x: usize, z: usize, width: usize) -> &[Span] {
+        if width == 1 {
+            return self.columns.spans(z * 16 + x);
+        }
+        let level = width.trailing_zeros() as usize - 1;
+        self.level(level)
+            .spans((z / width) * (16 / width) + x / width)
+    }
+}
+enum Job {
+    Sample(TileKey),
+    /// Summarize the chunk `Shared::observed` holds for this column.
+    Observe((i32, i32)),
+    RequestDetail {
+        chunks: Vec<(i32, i32)>,
+        center: [i32; 2],
+        /// `Lod::refreshes` when asked: what was read before a later
+        /// `refresh` may be older than what it announced.
+        refreshes: u64,
+    },
+}
+/// A chunk's columns on their way to the tiles over it: what `Lod::receive`
+/// defers when a frame's [`DETAIL_BUDGET`] is spent.
+enum Summary {
+    /// A chunk's detail, and the `refreshes` of the request it answers.
+    Detail((i32, i32), ReducedColumns, u64),
+    /// A visited chunk's summary.
+    Observed((i32, i32), ReducedColumns),
+}
+enum Done {
+    /// A chunk's detail, and the `refreshes` of the request it answers.
+    Detail((i32, i32), ReducedColumns, u64),
+    /// A visited chunk's summary (`Job::Observe`).
+    Observed((i32, i32), ReducedColumns),
+    DetailRequested,
+    Sample {
+        key: TileKey,
+        tile: Option<TileColumns>,
+    },
+    Mesh {
+        key: TileKey,
+        version: u64,
+        mesh: SectionMesh,
+        canceled: Arc<AtomicBool>,
+    },
+    MeshCanceled {
+        key: TileKey,
+        version: u64,
+    },
+}
+/// One tile's mesh job. Every job of a batch shares one immutable snapshot,
+/// so tiles are meshed in parallel without cloning columns or maps.
+struct MeshJob {
+    snapshot: Arc<Snapshot>,
+    key: TileKey,
+    version: u64,
+    finer: Vec<TileKey>,
+    covered: Arc<FxHashSet<(i32, i32)>>,
+    bounds: Option<[i32; 4]>,
+    canceled: Arc<AtomicBool>,
+}
+struct MeshQueued {
+    /// Lower is more urgent: near tiles first.
+    priority: i64,
+    order: u64,
+    job: MeshJob,
+}
+impl PartialEq for MeshQueued {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.order == other.order
+    }
+}
+impl Eq for MeshQueued {}
+impl PartialOrd for MeshQueued {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for MeshQueued {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // `BinaryHeap` is a max-heap: lower priority values pop first.
+        other
+            .priority
+            .cmp(&self.priority)
+            .then(other.order.cmp(&self.order))
+    }
+}
+/// A tile the sampler should produce next: by `class`
+/// (`wanted_tiles`), then nearest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Wanted {
+    class: u8,
+    distance: i64,
+    x: i32,
+    z: i32,
+    level: u8,
+}
+struct Shared {
+    jobs: Mutex<VecDeque<Job>>,
+    /// Tile meshes, nearest and most urgent first.
+    mesh_jobs: Mutex<std::collections::BinaryHeap<MeshQueued>>,
+    /// The latest chunk to summarize per column, queued as `Job::Observe`
+    /// once: edits made before the worker gets to it are summarized once.
+    observed: Mutex<FxHashMap<(i32, i32), Arc<Chunk>>>,
+    /// `state_kinds`, from the first observed chunk's facts.
+    kinds: std::sync::OnceLock<Vec<u8>>,
+    wake: Condvar,
+    mesh_wake: Condvar,
+    stop: AtomicBool,
+    /// Reduced far detail: samplers approximate wide cells.
+    approximate: AtomicBool,
+    /// Tiles' quads get their looks: `mesh::Mesher::looks`.
+    looks: std::sync::atomic::AtomicU8,
+    /// A `shaders/` pack draws the terrain: `mesh::Mesher::shader_pack`.
+    shader_pack: AtomicBool,
+    /// The reduction levels `Lod::apply_detail` reads, one bit each (level
+    /// `i` is a cell `2 << i` blocks wide), so the far terrain thread builds
+    /// them before it sends a chunk's columns on.
+    ///
+    /// Learned rather than derived from the plan: a chunk's ancestors are
+    /// read only where they were sampled, which the plan alone does not say.
+    /// `apply_detail` sets a bit the first time it reads that width, so the
+    /// first chunk of a width still reduces on the render thread and every
+    /// chunk after it finds the work done. Bits are never cleared: a width
+    /// the view has stopped using costs the worker a reduction nothing
+    /// reads, and holding all four is exactly the eager behaviour this
+    /// replaces.
+    detail_widths: std::sync::atomic::AtomicU8,
+    /// On small machines, hold queued far meshing while near terrain loads.
+    mesh_held: AtomicBool,
+    /// The near terrain is loading: the far threads step behind it
+    /// (`horizon_threads::far_terrain_behind`) and, on macOS, come back once
+    /// it is in.
+    near_loading: AtomicBool,
+}
+/// Puts the calling far terrain thread behind the near terrain while it
+/// loads, and back once it is in. `behind`: where the thread is now.
+fn step_behind(shared: &Shared, behind: &mut bool) {
+    let loading = shared.near_loading.load(Ordering::Relaxed);
+    if loading != *behind {
+        horizon_threads::far_terrain_behind(loading);
+        *behind = loading;
+    }
+}
+/// A background worker, sampling and meshing threads, and a bounded queue of
+/// sample jobs (`sample_jobs`). Only the current view's quadtree and a
+/// bounded set of visited summaries are retained.
+pub struct Lod {
+    shared: Arc<Shared>,
+    thread: Option<thread::JoinHandle<()>>,
+    mesh_threads: Vec<thread::JoinHandle<()>>,
+    results: mpsc::Receiver<Done>,
+    #[cfg(test)]
+    context: Option<Arc<WorkerContext>>,
+    /// A finished mesh job may have changed the selection of its ancestors.
+    reselect: bool,
+    area: Option<([i32; 2], i32, u32, i32, bool, Option<ZoomAim>)>,
+    plan: Plan,
+    /// Reduced far detail (`set_reduced_detail`).
+    reduced_detail: bool,
+    pending: FxHashSet<TileKey>,
+    detail_masks: FxHashMap<TileKey, [u64; 4]>,
+    detail_request_pending: bool,
+    /// Detail and visited summaries past a frame's [`DETAIL_BUDGET`], applied
+    /// on the frames after it. Bounded by what the worker sends: a detail
+    /// request is one per 250 ms and only for chunks whose detail is missing,
+    /// so this drains between bursts rather than growing with the view.
+    detail_backlog: std::collections::VecDeque<Summary>,
+    /// `refresh`es so far (`Job::RequestDetail`), and the areas of the last
+    /// ones, each with its number.
+    refreshes: u64,
+    refreshed: VecDeque<(u64, [i32; 4])>,
+    detail_request_at: std::time::Instant,
+    /// Four threads or fewer: far work waits for the near terrain (`hold`).
+    small: bool,
+    /// Sample jobs that may be queued or running at once.
+    sample_jobs: usize,
+    /// The near terrain is loading (`set_near_loading`).
+    near_loading: bool,
+    /// The world entry's first near load limits far work (`limited`).
+    first_load: FirstLoad,
+    /// While `limited`: a sample went last, so a dirty tile is meshed next.
+    mesh_turn: bool,
+    /// When `request_samples` last started a job while held.
+    held_sample_at: std::time::Instant,
+    /// Tiles whose sampling failed, and when they may be asked again.
+    retry: FxHashMap<TileKey, std::time::Instant>,
+    /// Each tile's samples, shared with mesh jobs in flight.
+    ready: FxHashMap<TileKey, Arc<TileColumns>>,
+    /// Fully covered subtrees, by tile.
+    complete: FxHashMap<TileKey, bool>,
+    /// Sampled tiles whose source has more since (`refresh`): sampled again,
+    /// their old samples drawn meanwhile.
+    stale: FxHashSet<TileKey>,
+    /// Stale tiles `refresh`ed again while sampled: that sample may be older.
+    restale: FxHashSet<TileKey>,
+    active: FxHashSet<TileKey>,
+    /// The active tiles' `ready` samples, as mesh jobs read them (`sync_sample`).
+    mesh_samples: samples::Samples,
+    /// Tiles needing a mesh, with the revision their job must carry.
+    dirty: FxHashMap<TileKey, u64>,
+    /// The newest revision of each active tile's mesh.
+    mesh_version: FxHashMap<TileKey, u64>,
+    /// The newest revision accepted by the renderer for each active tile.
+    /// Older in-flight results can still fill a hole while a newer job waits.
+    shown_version: FxHashMap<TileKey, u64>,
+    /// Cancellation tokens for queued or running jobs of active tiles.
+    mesh_cancel: FxHashMap<TileKey, Arc<AtomicBool>>,
+    next_version: u64,
+    /// Mesh jobs queued or running; the cutout waits for all of them.
+    outstanding_meshes: usize,
+    /// Workers in the mesh pool (dispatch coalesces above four each).
+    mesh_workers: usize,
+    /// Tiles whose active replacement mesh has been returned and applied.
+    meshed: FxHashSet<TileKey>,
+    /// Active tiles whose current revision has no mesh yet.
+    unmeshed: FxHashSet<TileKey>,
+    /// Tiles that left the selection. The renderer may only fade them out
+    /// once every active tile overlapping them has its mesh, or a hole opens.
+    removed_pending: FxHashSet<TileKey>,
+    /// Released removals, returned to the renderer this update.
+    removed: Vec<TileKey>,
+    /// The columns left out: `full` and `retiring`.
+    covered: Arc<FxHashSet<(i32, i32)>>,
+    covered_bounds: Option<[i32; 4]>,
+    /// The full-detail columns `update` was last given.
+    full: FxHashSet<(i32, i32)>,
+    /// Columns that left the full-detail area, still left out (their
+    /// full-detail meshes still drawn) until the tile planned there is ready
+    /// (`Plan::replaces`). Tiles inside that area are never sampled: when the
+    /// render distance shrinks, their coarsest ancestors would otherwise
+    /// stand in for it for minutes.
+    retiring: FxHashSet<(i32, i32)>,
+    /// Columns that started retiring since the game last took them
+    /// (`take_summary_asks`): a resident chunk there is summarized now, not
+    /// when it arrived (`summarizes_arrivals`).
+    summary_asks: FxHashSet<(i32, i32)>,
+    /// Summaries queued (`observe`) and not applied yet, by column: a
+    /// retiring column waits for its own instead of asking the source for
+    /// detail, which could be drawn for a few frames before it.
+    summarizing: FxHashMap<(i32, i32), u32>,
+    /// The covered columns the active meshes leave out, when a mesh job
+    /// has finished since the last `take_cutout`.
+    cutout: Option<Arc<FxHashSet<(i32, i32)>>>,
+    /// Covered columns changed while meshes were in flight: the renderer must
+    /// not drop full-detail sections before every replacement is uploaded.
+    cutout_pending: Option<Arc<FxHashSet<(i32, i32)>>>,
+    /// Active tiles whose mesh must be accepted before the cutout publishes.
+    cutout_waiting: FxHashSet<TileKey>,
+    /// Unsample final tiles, nearest first. Rebuilt when the view changes,
+    /// not scanned every frame.
+    wanted: std::collections::BinaryHeap<std::cmp::Reverse<Wanted>>,
+    wanted_at: Option<[i32; 2]>,
+    wanted_stale: bool,
+    saved: Saved,
+    reduced: Reduced,
+    saved_order: VecDeque<(i32, i32)>,
+    /// Tiles the plan let go, taken back on a return instead of sampled again.
+    kept: kept::KeptTiles,
+    /// Kept tiles the plan wants again, not taken back yet (`bring_back`).
+    returning: Vec<TileKey>,
+    /// When the plan last asked kept tiles back (`RETURN_SEAM_WAIT`).
+    returned_at: std::time::Instant,
+    /// `LodSource::keeps_observed`: tiles sampled without an observed chunk
+    /// are sampled again (`resample_over`).
+    keeps_observed: bool,
+}
+impl Lod {
+    /// Tiles meshed from now on carry their quads' looks for a shader pack that reads them
+    /// (`Mesher::looks`), with the Nether's face shades where `nether`.
+    pub fn set_looks(&self, looks: bool, nether: bool) {
+        let mode = if looks { 1 + u8::from(nether) } else { 0 };
+        self.shared.looks.store(mode, Ordering::Relaxed);
+    }
+    /// Tiles meshed from now on are for a `shaders/` pack (`Mesher::shader_pack`).
+    pub fn set_shader_pack(&self, on: bool) {
+        self.shared.shader_pack.store(on, Ordering::Relaxed);
+    }
+    pub fn new(source: Arc<dyn LodSource>, context: Arc<WorkerContext>) -> Self {
+        Self::assemble(Some(source), Some(context), true)
+    }
+    /// Scheduler-only instance for tests: no worker threads, so a test can
+    /// pop the jobs it queued and finish samples itself.
+    #[cfg(test)]
+    fn scheduler_for_test() -> Self {
+        Self::assemble(None, None, false)
+    }
+    fn assemble(
+        source: Option<Arc<dyn LodSource>>,
+        context: Option<Arc<WorkerContext>>,
+        workers: bool,
+    ) -> Self {
+        let keeps_observed = source
+            .as_ref()
+            .is_some_and(|source| source.keeps_observed());
+        let cores = horizon_threads::worker_count();
+        let shared = Arc::new(Shared {
+            jobs: Mutex::new(VecDeque::new()),
+            mesh_jobs: Mutex::new(std::collections::BinaryHeap::new()),
+            observed: Mutex::new(FxHashMap::default()),
+            kinds: std::sync::OnceLock::new(),
+            wake: Condvar::new(),
+            mesh_wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            approximate: AtomicBool::new(false),
+            looks: Default::default(),
+            shader_pack: AtomicBool::new(false),
+            detail_widths: std::sync::atomic::AtomicU8::new(0),
+            mesh_held: AtomicBool::new(false),
+            near_loading: AtomicBool::new(false),
+        });
+        let worker = shared.clone();
+        let (tx, results) = mpsc::channel();
+        #[cfg(test)]
+        let lod_context = context.clone();
+        // Meshing runs on its own pool: one worker serialized every dirty
+        // tile of a batch, however many cores the machine had.
+        let mut mesh_threads = Vec::new();
+        let mut handle = None;
+        if workers {
+            let source = source.expect("workers need a terrain source");
+            for _ in 0..meshing_threads(cores) {
+                let shared = shared.clone();
+                let tx = tx.clone();
+                let context = context.clone().expect("mesh workers need a context");
+                mesh_threads.push(
+                    thread::Builder::new()
+                        .name("Far meshing".into())
+                        .spawn(move || {
+                            horizon_threads::far_terrain_current();
+                            let mut behind = true;
+                            let mut mesher = mesh::Mesher::default();
+                            loop {
+                                let job = {
+                                    let mut jobs = shared.mesh_jobs.lock().unwrap();
+                                    loop {
+                                        if shared.stop.load(Ordering::Relaxed) {
+                                            return;
+                                        }
+                                        if shared.mesh_held.load(Ordering::Relaxed) {
+                                            jobs = shared.mesh_wake.wait(jobs).unwrap();
+                                            continue;
+                                        }
+                                        if let Some(job) = jobs.pop() {
+                                            break job.job;
+                                        }
+                                        jobs = shared.mesh_wake.wait(jobs).unwrap();
+                                    }
+                                };
+                                if job.canceled.load(Ordering::Acquire) {
+                                    if tx
+                                        .send(Done::MeshCanceled {
+                                            key: job.key,
+                                            version: job.version,
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                step_behind(&shared, &mut behind);
+                                let keep_finer = !job.finer.is_empty();
+                                let input = job.snapshot.mesh_input(job.key, job.finer);
+                                let columns = input.columns();
+                                let edges = input.edges();
+                                mesher.looks = shared.looks.load(Ordering::Relaxed);
+                                mesher.shader_pack = shared.shader_pack.load(Ordering::Relaxed);
+                                let mut mesh = mesher.mesh(
+                                    job.key,
+                                    &columns,
+                                    &job.covered,
+                                    job.bounds,
+                                    &context,
+                                    &edges,
+                                    &input.finer,
+                                );
+                                // Sorts the quads by facing side without
+                                // building near-section compact records or
+                                // unused meshlets: `Renderer::upload_lod`
+                                // never consumes `mesh.meshlets`, and far-tile
+                                // compact records (`lod::packed`) are laid out
+                                // immediately below.
+                                mesh.sort_solid_for_lod();
+                                crate::lod::packed::lay_out(&mut mesh);
+                                mesh.keep = keep_finer
+                                    || tile_overlaps_covered(job.key, &job.covered, job.bounds);
+                                if job.canceled.load(Ordering::Acquire) {
+                                    if tx
+                                        .send(Done::MeshCanceled {
+                                            key: job.key,
+                                            version: job.version,
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if tx
+                                    .send(Done::Mesh {
+                                        key: job.key,
+                                        version: job.version,
+                                        mesh,
+                                        canceled: job.canceled,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        })
+                        .expect("far meshing worker"),
+                );
+            }
+            handle = Some(
+                thread::Builder::new()
+                    .name("Far terrain".into())
+                    .spawn(move || {
+                        // Ticks and frames come first (horizon_threads).
+                        horizon_threads::far_terrain_current();
+                        let mut behind = true;
+                        let mut sampler = source.sampler();
+                        let count = sampling_threads(cores);
+                        let mut sampling = Vec::new();
+                        for _ in 0..count {
+                            let Some(mut sample) = sampler.fork() else {
+                                break;
+                            };
+                            let shared = worker.clone();
+                            let tx = tx.clone();
+                            sampling.push(
+                                thread::Builder::new()
+                                    .name("Far sampling".into())
+                                    .spawn(move || {
+                                        horizon_threads::far_terrain_current();
+                                        let mut behind = true;
+                                        loop {
+                                            let key = {
+                                                let mut jobs = shared.jobs.lock().unwrap();
+                                                loop {
+                                                    if shared.stop.load(Ordering::Relaxed) {
+                                                        return;
+                                                    }
+                                                    if let Some(index) =
+                                                        jobs.iter().position(|job| {
+                                                            matches!(job, Job::Sample(_))
+                                                        })
+                                                    {
+                                                        let Some(Job::Sample(key)) =
+                                                            jobs.remove(index)
+                                                        else {
+                                                            unreachable!()
+                                                        };
+                                                        break key;
+                                                    }
+                                                    jobs = shared.wake.wait(jobs).unwrap();
+                                                }
+                                            };
+                                            step_behind(&shared, &mut behind);
+                                            let [x, _, z] = key.origin();
+                                            sample.set_approximate(
+                                                shared.approximate.load(Ordering::Relaxed),
+                                            );
+                                            let samples =
+                                                sample.grid(x, z, key.size() / CELLS as i32, CELLS);
+                                            if shared.stop.load(Ordering::Relaxed) {
+                                                return;
+                                            }
+                                            let tile = (samples.len() == CELLS * CELLS)
+                                                .then(|| TileColumns::from_columns(&samples));
+                                            if tx.send(Done::Sample { key, tile }).is_err() {
+                                                return;
+                                            }
+                                        }
+                                    })
+                                    .expect("far sampling worker"),
+                            );
+                        }
+                        let mut asked = 0;
+                        'work: loop {
+                            for (key, columns) in sampler.drain_details() {
+                                if tx
+                                    .send(Done::Detail(
+                                        key,
+                                        ReducedColumns::new(columns)
+                                            .warm(worker.detail_widths.load(Ordering::Relaxed)),
+                                        asked,
+                                    ))
+                                    .is_err()
+                                {
+                                    break 'work;
+                                }
+                            }
+                            let job = {
+                                let mut jobs = worker.jobs.lock().unwrap();
+                                if (jobs.is_empty()
+                                    || (!sampling.is_empty()
+                                        && jobs.iter().all(|job| matches!(job, Job::Sample(_)))))
+                                    && !worker.stop.load(Ordering::Relaxed)
+                                {
+                                    jobs = worker
+                                        .wake
+                                        .wait_timeout(jobs, std::time::Duration::from_millis(100))
+                                        .unwrap()
+                                        .0;
+                                }
+                                if worker.stop.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                // Summaries and detail requests first: they
+                                // would otherwise wait behind a whole queue of
+                                // samples where no sampling threads take them.
+                                let other =
+                                    jobs.iter().position(|job| !matches!(job, Job::Sample(_)));
+                                if let Some(index) = other {
+                                    jobs.remove(index)
+                                } else if sampling.is_empty() {
+                                    jobs.pop_front()
+                                } else {
+                                    None
+                                }
+                            };
+                            let Some(job) = job else { continue };
+                            step_behind(&worker, &mut behind);
+                            let done = match job {
+                                Job::Observe(key) => {
+                                    let chunk = worker.observed.lock().unwrap().remove(&key);
+                                    let (Some(chunk), Some(kinds)) = (chunk, worker.kinds.get())
+                                    else {
+                                        continue;
+                                    };
+                                    let columns = summarize(&chunk, kinds);
+                                    sampler.observed(key, &columns);
+                                    Done::Observed(
+                                        key,
+                                        ReducedColumns::new(columns)
+                                            .warm(worker.detail_widths.load(Ordering::Relaxed)),
+                                    )
+                                }
+                                Job::RequestDetail {
+                                    chunks,
+                                    center,
+                                    refreshes,
+                                } => {
+                                    asked = refreshes;
+                                    sampler.request_detail(&chunks, center);
+                                    Done::DetailRequested
+                                }
+                                Job::Sample(key) => {
+                                    let [x, _, z] = key.origin();
+                                    sampler.set_approximate(
+                                        worker.approximate.load(Ordering::Relaxed),
+                                    );
+                                    let samples =
+                                        sampler.grid(x, z, key.size() / CELLS as i32, CELLS);
+                                    let tile = (samples.len() == CELLS * CELLS)
+                                        .then(|| TileColumns::from_columns(&samples));
+                                    Done::Sample { key, tile }
+                                }
+                            };
+                            if tx.send(done).is_err() {
+                                break;
+                            }
+                        }
+                        let jobs = worker.jobs.lock();
+                        worker.stop.store(true, Ordering::Relaxed);
+                        drop(jobs);
+                        worker.wake.notify_all();
+                        for handle in sampling {
+                            let _ = handle.join();
+                        }
+                    })
+                    .expect("far terrain worker"),
+            );
+        }
+
+        Self {
+            shared,
+            thread: handle,
+            mesh_threads,
+            results,
+            #[cfg(test)]
+            context: lod_context,
+            reselect: true,
+            area: None,
+            reduced_detail: false,
+            plan: Plan::default(),
+            pending: FxHashSet::default(),
+            detail_masks: FxHashMap::default(),
+            detail_request_pending: false,
+            detail_backlog: std::collections::VecDeque::new(),
+            refreshes: 0,
+            refreshed: VecDeque::new(),
+            detail_request_at: std::time::Instant::now(),
+            small: cores <= 4,
+            sample_jobs: sampling_threads(cores) * QUEUED_PER_SAMPLER,
+            near_loading: false,
+            // Armed explicitly on world entry (`arm_first_load`), so rebuilds
+            // (shader pack changes, resource reloads, settings toggles) in an
+            // already-loaded world never start a new first-load hold.
+            first_load: FirstLoad::Over,
+            mesh_turn: false,
+            held_sample_at: std::time::Instant::now(),
+            retry: FxHashMap::default(),
+            ready: FxHashMap::default(),
+            complete: FxHashMap::default(),
+            active: FxHashSet::default(),
+            mesh_samples: samples::Samples::default(),
+            dirty: FxHashMap::default(),
+            mesh_version: FxHashMap::default(),
+            shown_version: FxHashMap::default(),
+            mesh_cancel: FxHashMap::default(),
+            next_version: 1,
+            outstanding_meshes: 0,
+            mesh_workers: meshing_threads(cores),
+            meshed: FxHashSet::default(),
+            unmeshed: FxHashSet::default(),
+            removed_pending: FxHashSet::default(),
+            stale: FxHashSet::default(),
+            restale: FxHashSet::default(),
+            removed: Vec::new(),
+            covered: Arc::default(),
+            covered_bounds: None,
+            full: FxHashSet::default(),
+            retiring: FxHashSet::default(),
+            summary_asks: FxHashSet::default(),
+            summarizing: FxHashMap::default(),
+            cutout: None,
+            cutout_pending: None,
+            cutout_waiting: FxHashSet::default(),
+            wanted: std::collections::BinaryHeap::new(),
+            wanted_at: None,
+            wanted_stale: true,
+            saved: Saved::default(),
+            reduced: Reduced::default(),
+            saved_order: VecDeque::new(),
+            kept: kept::KeptTiles::new(kept::KEPT_FOR, kept::KEPT_BYTES),
+            returning: Vec::new(),
+            returned_at: std::time::Instant::now(),
+            keeps_observed,
+        }
+    }
+    /// The solid ground at block column (x, z): its top face's height and
+    /// its block, from the finest tile sampled there. For aiming past the
+    /// resident chunks (`game.raycast`); water is passed, as the view's ray
+    /// passes it.
+    pub fn ground(&self, x: i32, z: i32) -> Option<(i32, BlockStateId)> {
+        self.surface(x, z).map(|s| (s.height, s.state))
+    }
+    /// The surface at block column (x, z) as the far terrain draws it: from
+    /// the finest tile sampled there whose cell holds one, whether or not the
+    /// chunk is loaded (a client mod's map past the loaded chunks).
+    pub fn surface(&self, x: i32, z: i32) -> Option<Surface> {
+        surface_in(&self.ready, x, z)
+    }
+    /// The highest retained material run in each cell of this exact ready tile,
+    /// in row-major order. Detailed tiles can hold runs without surface metadata.
+    /// No fallback to another level and no work scheduled for a missing tile.
+    pub fn tile_top_spans(
+        &self,
+        key: TileKey,
+    ) -> Option<impl ExactSizeIterator<Item = Option<Span>> + '_> {
+        let tile = self
+            .ready
+            .get(&key)
+            .filter(|tile| tile.len() == CELLS * CELLS)?;
+        Some((0..CELLS * CELLS).map(|index| tile.spans(index).last().copied()))
+    }
+
+    /// A tile's samples as though its source had returned them, for a test
+    /// outside this crate reading the far terrain.
+    #[cfg(feature = "test-support")]
+    pub fn insert_ready_for_test(&mut self, key: TileKey, columns: Vec<Column>) {
+        self.ready
+            .insert(key, Arc::new(TileColumns::from_columns(&columns)));
+    }
+    pub fn stats(&self) -> (usize, usize) {
+        (self.active.len(), self.ready.len())
+    }
+    /// The tiles kept for a return, and about how many bytes they hold.
+    pub fn kept(&self) -> (usize, usize) {
+        (self.kept.len(), self.kept.bytes())
+    }
+    pub fn progress(&self) -> (usize, usize) {
+        let mut desired = 0;
+        let mut sampled = 0;
+        for key in self.plan.nodes.iter() {
+            if !self.plan.split.contains(key) {
+                desired += 1;
+                sampled += usize::from(self.ready.contains_key(key));
+            }
+        }
+        (desired, sampled)
+    }
+    /// Drawn columns that take their chunk's generated detail (trees,
+    /// structures; `request_detail`), and how many of them have it.
+    /// `refined_samples` counts the detail of every drawn tile instead.
+    pub fn detail_progress(&self) -> (usize, usize) {
+        self.active
+            .iter()
+            .filter(|key| self.wants_detail(key))
+            .fold((0, 0), |(wanted, refined), key| {
+                let mask = self.detail_masks.get(key).map_or(0, detail_count);
+                (wanted + CELLS * CELLS, refined + mask)
+            })
+    }
+    pub fn refined_samples(&self) -> usize {
+        self.active
+            .iter()
+            .filter_map(|key| self.detail_masks.get(key))
+            .map(detail_count)
+            .sum()
+    }
+    /// An active tile whose columns take generated chunks' detail.
+    fn wants_detail(&self, key: &TileKey) -> bool {
+        key.level <= DETAIL_LEVEL
+            && !self.plan.split.contains(key)
+            && !(key.level == 0 && self.covered.contains(&(key.x, key.z)))
+    }
+    pub fn removed(&mut self) -> Vec<TileKey> {
+        std::mem::take(&mut self.removed)
+    }
+    /// The full-detail columns the active meshes leave out, once per finished
+    /// mesh job. Until a column leaves this set, nothing distant stands in for
+    /// it: its full-detail terrain must still be drawn, in or past the render
+    /// distance, or a hole opens there.
+    pub fn take_cutout(&mut self) -> Option<FxHashSet<(i32, i32)>> {
+        self.cutout.take().map(Arc::unwrap_or_clone)
+    }
+    /// Marks an active tile for remeshing. Versioned so a result from an
+    /// older batch can never overwrite a newer one.
+    fn cancel_mesh(&mut self, key: TileKey) {
+        if let Some(token) = self.mesh_cancel.remove(&key) {
+            token.store(true, Ordering::Release);
+            self.shared.mesh_wake.notify_all();
+        }
+    }
+    fn mark_mesh(&mut self, key: TileKey) {
+        if !self.active.contains(&key) {
+            return;
+        }
+        let version = self.next_version;
+        self.next_version += 1;
+        self.dirty.insert(key, version);
+        self.mesh_version.insert(key, version);
+        self.meshed.remove(&key);
+        self.unmeshed.insert(key);
+    }
+    /// The tile's selection changed: its own mesh, every selected fallback
+    /// ancestor that clips around its footprint, and its face neighbours.
+    fn mark_selection_changed(&mut self, key: TileKey) {
+        self.mark_mesh(key);
+        // A fallback ancestor's mesh is clipped around this tile.
+        let mut node = key;
+        while node.level < MAX_LEVEL {
+            node = node.parent();
+            if self.active.contains(&node) {
+                self.mark_mesh(node);
+            }
+        }
+        self.mark_side_neighbors_of(key);
+        self.mark_active_descendants(key);
+    }
+    /// The tile's columns changed but its footprint did not. A fallback
+    /// ancestor clips around footprints, not column values, so only the tile
+    /// and the neighbours whose edge columns read it need remeshing.
+    fn mark_data_changed(&mut self, key: TileKey) {
+        self.mark_mesh(key);
+        self.mark_side_neighbors_of(key);
+        if self.active.contains(&key) {
+            self.mark_active_descendants(key);
+        }
+    }
+    /// An active descendant's edge columns can resolve to this tile when the
+    /// finer tile it faces is not selected; its mesh must follow this one.
+    fn mark_active_descendants(&mut self, key: TileKey) {
+        if !self.plan.split.contains(&key) {
+            return;
+        }
+        for child in key.children() {
+            if !self.plan.nodes.contains(&child) {
+                continue;
+            }
+            if self.active.contains(&child) {
+                self.mark_mesh(child);
+            }
+            self.mark_active_descendants(child);
+        }
+    }
+    /// Neighbours only along the sides this footprint touches: a large
+    /// changed tile otherwise marks the whole world.
+    fn mark_side_neighbors_of(&mut self, key: TileKey) {
+        let [kx, _, kz] = key.origin();
+        let size = key.size();
+        let mut node = key;
+        loop {
+            let [nx, _, nz] = node.origin();
+            let extent = node.size();
+            if kx == nx {
+                self.mark_side_neighbors(node, 0, key);
+            }
+            if kx + size == nx + extent {
+                self.mark_side_neighbors(node, 1, key);
+            }
+            if kz == nz {
+                self.mark_side_neighbors(node, 2, key);
+            }
+            if kz + size == nz + extent {
+                self.mark_side_neighbors(node, 3, key);
+            }
+            if node.level == MAX_LEVEL {
+                break;
+            }
+            node = node.parent();
+        }
+    }
+    /// The interval a tile covers along the edge of `side` (west/east run
+    /// along z, north/south along x).
+    fn side_interval(key: TileKey, side: usize) -> (i32, i32) {
+        let [x, _, z] = key.origin();
+        if side < 2 {
+            (z, z + key.size())
+        } else {
+            (x, x + key.size())
+        }
+    }
+    fn side_overlaps(candidate: TileKey, side: usize, changed: TileKey) -> bool {
+        let (c0, c1) = Self::side_interval(candidate, side);
+        let (k0, k1) = Self::side_interval(changed, side);
+        c0 < k1 && k0 < c1
+    }
+    /// Whether `child` sits on the face of `parent` shared with the tile the
+    /// walk came from. Children behind that face are not adjacent to it.
+    fn side_flush(child: TileKey, side: usize, parent: TileKey) -> bool {
+        let (cs, ps) = (child.size(), parent.size());
+        match side {
+            0 => (child.x + 1) * cs == (parent.x + 1) * ps,
+            1 => child.x * cs == parent.x * ps,
+            2 => (child.z + 1) * cs == (parent.z + 1) * ps,
+            _ => child.z * cs == parent.z * ps,
+        }
+    }
+    /// The selected tiles across one side of `node`, descending only through
+    /// split neighbours that face the changed footprint.
+    fn mark_side_neighbors(&mut self, node: TileKey, side: usize, changed: TileKey) {
+        let (dx, dz) = match side {
+            0 => (-1, 0),
+            1 => (1, 0),
+            2 => (0, -1),
+            _ => (0, 1),
+        };
+        let neighbor = TileKey {
+            x: node.x + dx,
+            z: node.z + dz,
+            level: node.level,
+        };
+        self.mark_neighbor_tree(neighbor, side, changed);
+    }
+    fn mark_neighbor_tree(&mut self, neighbor: TileKey, side: usize, changed: TileKey) {
+        if !self.plan.nodes.contains(&neighbor) {
+            return;
+        }
+        if self.active.contains(&neighbor) {
+            self.mark_mesh(neighbor);
+        }
+        if self.plan.split.contains(&neighbor) {
+            for child in neighbor.children() {
+                if Self::side_flush(child, side, neighbor)
+                    && Self::side_overlaps(child, side, changed)
+                {
+                    self.mark_neighbor_tree(child, side, changed);
+                }
+            }
+        }
+    }
+    /// `Plan::select` as a cached state: a node is complete when its ready
+    /// subtree can stand alone, and active when its own mesh is drawn.
+    fn evaluate(&self, key: TileKey) -> (bool, bool) {
+        let present = self.ready.contains_key(&key);
+        // Covered level-0 stand-ins complete their parent but are never drawn.
+        let ready = present && !(key.level == 0 && self.covered.contains(&(key.x, key.z)));
+        // Mirrors `Plan::select`: a ready split tile away from the seam is a
+        // complete stand-in even while its children are still incomplete,
+        // so no second fallback is drawn above it.
+        let (complete, active) = if self.plan.split.contains(&key) {
+            let children = key.children().into_iter().all(|child| {
+                !self.plan.nodes.contains(&child)
+                    || self.complete.get(&child).copied().unwrap_or(false)
+            });
+            let ready = ready && self.plan.stands_in(key);
+            (children || ready, ready && !children)
+        } else {
+            (present, ready)
+        };
+        (complete, active)
+    }
+    /// Re-evaluates `key` and its ancestors after its readiness or coverage
+    /// changed. Work is O(tree depth), not O(plan), per finished sample.
+    fn refresh_path(&mut self, key: TileKey) {
+        let mut node = key;
+        loop {
+            if !self.plan.nodes.contains(&node) {
+                break;
+            }
+            let (complete, active) = self.evaluate(node);
+            let old = self.complete.insert(node, complete);
+            let was_active = self.active.contains(&node);
+            if active != was_active {
+                if active {
+                    self.active.insert(node);
+                    self.sync_sample(node);
+                    self.removed_pending.remove(&node);
+                } else {
+                    self.active.remove(&node);
+                    self.sync_sample(node);
+                    self.removed_pending.insert(node);
+                    self.cancel_mesh(node);
+                    self.mesh_version.remove(&node);
+                    self.shown_version.remove(&node);
+                    self.meshed.remove(&node);
+                    self.unmeshed.remove(&node);
+                    self.dirty.remove(&node);
+                    self.transfer_cutout_wait(node);
+                }
+            }
+            // A pure completion change on an undrawn node changes no mesh;
+            // only the ancestors' own transitions can. Marking descendants
+            // here made tree completion remesh the whole view.
+            if active != was_active {
+                self.mark_selection_changed(node);
+            }
+            if old == Some(complete) || node.level >= MAX_LEVEL {
+                break;
+            }
+            node = node.parent();
+        }
+    }
+    /// New or replaced samples for `key`. `existed`: its old data was drawn,
+    /// so the tile and its edge neighbours must be remeshed; a new tile is
+    /// already dirty through its selection change.
+    fn refresh_ready(&mut self, key: TileKey, existed: bool) {
+        self.refresh_path(key);
+        if existed {
+            self.mark_data_changed(key);
+        }
+    }
+    pub fn invalidate_chunk(&mut self, x: i32, z: i32) {
+        // The tiles touching the chunk: a few per level, not every active one.
+        for level in 0..=MAX_LEVEL {
+            let size = 16 << level;
+            for kz in (z * 16).div_euclid(size) - 1..=((z + 1) * 16).div_euclid(size) {
+                for kx in (x * 16).div_euclid(size) - 1..=((x + 1) * 16).div_euclid(size) {
+                    let key = TileKey {
+                        x: kx,
+                        z: kz,
+                        level,
+                    };
+                    let [ox, _, oz] = key.origin();
+                    if x * 16 <= ox + size
+                        && (x + 1) * 16 >= ox
+                        && z * 16 <= oz + size
+                        && (z + 1) * 16 >= oz
+                        && self.active.contains(&key)
+                    {
+                        self.mark_mesh(key);
+                    }
+                }
+            }
+        }
+    }
+    /// The source has new data for the blocks `[x0, z0, x1, z1)`, drawn in
+    /// cells `widths` `(min, max)` blocks wide: the tiles of those cells over
+    /// them or beside (`refreshed_by`) are sampled again, and their chunks'
+    /// detail asked again, but for the chunks seen in the world. A tile whose
+    /// new samples are the old ones isn't meshed again.
+    pub fn refresh(&mut self, area: [i32; 4], widths: (i32, i32)) {
+        self.refreshes += 1;
+        if self.refreshed.len() >= MAX_REFRESHED {
+            self.refreshed.pop_front();
+        }
+        // Detail is of cells up to a chunk wide, which read a block around:
+        // a chunk around is plenty.
+        let m = 16;
+        let [x0, z0, x1, z1] = area;
+        self.refreshed.push_back((
+            self.refreshes,
+            [
+                x0.saturating_sub(m),
+                z0.saturating_sub(m),
+                x1.saturating_add(m),
+                z1.saturating_add(m),
+            ],
+        ));
+        // Tiles waiting out a retry are asked again now.
+        let retrying = self.retry.len();
+        self.retry.retain(|key, _| !key.refreshed_by(area, widths));
+        if self.retry.len() != retrying {
+            self.wanted_stale = true;
+        }
+        // Kept tiles there are as old: sampled again if the plan wants them.
+        self.kept.forget(|key, _| key.refreshed_by(area, widths));
+        // A first sample in flight read the old data too.
+        let keys: Vec<_> = self
+            .ready
+            .keys()
+            .chain(self.pending.iter())
+            .copied()
+            .filter(|key| {
+                key.refreshed_by(area, widths)
+                    && !(key.level == 0 && self.covered.contains(&(key.x, key.z)))
+            })
+            .collect();
+        for key in keys {
+            self.mark_stale(key);
+            if let Some(mask) = self.detail_masks.get_mut(&key) {
+                let area = TileKey::around(area, key.size() / CELLS as i32);
+                forget_detail(key, area, mask, |chunk| self.saved.contains_key(&chunk));
+            }
+        }
+    }
+    /// Whether chunk `(cx, cz)` was under a `refresh` after request `asked`
+    /// (or one too old to tell).
+    fn refreshed_since(&self, (cx, cz): (i32, i32), asked: u64) -> bool {
+        if asked >= self.refreshes {
+            return false;
+        }
+        let oldest = self.refreshed.front().map_or(u64::MAX, |&(n, _)| n);
+        asked + 1 < oldest
+            || self.refreshed.iter().any(|&(n, [x0, z0, x1, z1])| {
+                n > asked
+                    && cx * 16 < x1
+                    && (cx + 1) * 16 > x0
+                    && cz * 16 < z1
+                    && (cz + 1) * 16 > z0
+            })
+    }
+    /// The tile's samples lack data its source has now: sampled again, the
+    /// old ones drawn meanwhile, and once more after a sample in flight.
+    fn mark_stale(&mut self, key: TileKey) {
+        self.stale.insert(key);
+        self.wanted_stale = true;
+        if self.pending.contains(&key) {
+            self.restale.insert(key);
+        }
+    }
+    /// Capture actual block columns, including canopy gaps and material
+    /// layers: the worker summarizes the chunk (`summarize`, a few
+    /// milliseconds a chunk, and its reductions), then `finish_observed`
+    /// keeps it. Called for a chunk leaving the near area (unloaded, or
+    /// asked for by `take_summary_asks`), not for every chunk that arrives,
+    /// unless `summarizes_arrivals`.
+    pub fn observe(&mut self, chunk: Arc<Chunk>, facts: &BlockFacts) {
+        self.shared.kinds.get_or_init(|| state_kinds(facts));
+        let key = (chunk.x, chunk.z);
+        self.summary_asks.remove(&key);
+        if self
+            .shared
+            .observed
+            .lock()
+            .unwrap()
+            .insert(key, chunk)
+            .is_none()
+        {
+            // One `Done::Observed` comes back per job queued here.
+            *self.summarizing.entry(key).or_default() += 1;
+            self.shared
+                .jobs
+                .lock()
+                .unwrap()
+                .push_back(Job::Observe(key));
+            self.shared.wake.notify_all();
+        }
+    }
+    /// Whether every resident chunk is summarized as it arrives and as it
+    /// changes: the source keeps the summaries (`LodSource::keeps_observed`,
+    /// a server's terrain), so one never summarized would be missing from it
+    /// after the game quits, and it has nothing else to draw there. Other
+    /// sources draw a chunk under the near area from nothing (it is covered)
+    /// and summarize it once it leaves.
+    pub fn summarizes_arrivals(&self) -> bool {
+        self.keeps_observed
+    }
+    /// Up to `limit` columns that left the full-detail area and still need a
+    /// summary in the current far plan: the game summarizes those still
+    /// resident (`observe`) within `OBSERVE_AHEAD` before their full-detail
+    /// meshes can retire. Deferred columns stay queued for subsequent ticks.
+    pub fn take_summary_asks(&mut self, limit: usize) -> Vec<(i32, i32)> {
+        if limit == 0 || self.summary_asks.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(limit.min(self.summary_asks.len()));
+        let mut drop = Vec::new();
+        for &column in &self.summary_asks {
+            if !self.plan.needs_summary(column) {
+                drop.push(column);
+                continue;
+            }
+            out.push(column);
+            if out.len() == limit {
+                break;
+            }
+        }
+        for column in drop {
+            self.summary_asks.remove(&column);
+        }
+        for &column in &out {
+            self.summary_asks.remove(&column);
+        }
+        out
+    }
+    /// Whether the column's own summary is asked for or queued.
+    fn summary_on_its_way(&self, column: (i32, i32)) -> bool {
+        self.summary_asks.contains(&column) || self.summarizing.contains_key(&column)
+    }
+    /// Chunks waiting for the worker to summarize them. A resident chunk
+    /// held here is copied by its next edit (`Arc::make_mut`), so callers
+    /// hand over a few at a time (`OBSERVE_AHEAD`).
+    pub fn observing(&self) -> usize {
+        self.shared.observed.lock().unwrap().len()
+    }
+    /// Whether tiles new to the plan are being sampled: far terrain on its way,
+    /// meshed as soon as it is.
+    pub fn sampling(&self) -> bool {
+        !self.pending.is_empty()
+    }
+    /// Keeps a visited chunk's summary, unless it is unchanged; still restores
+    /// cached detail when the column's current fine tile lost it across a replan.
+    fn finish_observed(&mut self, key: (i32, i32), columns: ReducedColumns) {
+        if let Some(count) = self.summarizing.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                self.summarizing.remove(&key);
+            }
+        }
+        if let Some(saved) = self.saved.get(&key).cloned()
+            && *saved == *columns.columns
+        {
+            let fine = TileKey {
+                x: key.0,
+                z: key.1,
+                level: 0,
+            };
+            let fine_needs_detail = (self.plan.nodes.contains(&fine)
+                || self.ready.contains_key(&fine))
+                && (self.detail_masks.get(&fine) != Some(&[u64::MAX; 4])
+                    || self
+                        .ready
+                        .get(&fine)
+                        .is_none_or(|old| !Arc::ptr_eq(old, &saved) && **old != *saved));
+            if fine_needs_detail {
+                if let Some(reduced) = self.reduced.get(&key).cloned() {
+                    self.apply_detail(key, &reduced);
+                } else {
+                    self.apply_fine(key, &saved);
+                }
+            }
+            return;
+        }
+        if !self.saved.contains_key(&key) {
+            while self.saved.len() >= MAX_SAVED {
+                if let Some(old) = self.saved_order.pop_front() {
+                    self.saved.remove(&old);
+                    self.reduced.remove(&old);
+                }
+            }
+            self.saved_order.push_back(key);
+        }
+        self.saved.insert(key, columns.columns.clone());
+        if self.keeps_observed {
+            self.resample_over(key);
+        }
+        self.finish_detail(key, columns);
+    }
+    /// The source keeps the chunk now: the tiles over it whose samples lack
+    /// it are sampled again (`stale`), their old samples drawn meanwhile.
+    fn resample_over(&mut self, chunk: (i32, i32)) {
+        for key in resampled_over(&self.ready, &self.pending, chunk) {
+            self.mark_stale(key);
+        }
+        // Kept tiles with the chunk's hole: sampled again if the plan wants them.
+        let (cx, cz) = chunk;
+        self.kept.forget(|key, samples| {
+            let size = key.size();
+            let stride = size / CELLS as i32;
+            let [ox, _, oz] = key.origin();
+            if stride <= 16
+                || !(ox..ox + size).contains(&(cx * 16))
+                || !(oz..oz + size).contains(&(cz * 16))
+            {
+                return false;
+            }
+            let cell = ((cz * 16 - oz) / stride * CELLS as i32 + (cx * 16 - ox) / stride) as usize;
+            cell < samples.len() && samples.is_empty_column(cell)
+        });
+    }
+    /// A chunk's own columns as its level-0 tile; the same columns again
+    /// (asked again after a `refresh`) mesh nothing.
+    fn apply_fine(&mut self, (cx, cz): (i32, i32), columns: &Arc<TileColumns>) {
+        let fine = TileKey {
+            x: cx,
+            z: cz,
+            level: 0,
+        };
+        if !self.plan.nodes.contains(&fine) && !self.ready.contains_key(&fine) {
+            return;
+        }
+        self.detail_masks.insert(fine, [u64::MAX; 4]);
+        if self.ready.get(&fine).is_some_and(|old| **old == **columns) {
+            return;
+        }
+        let existed = self.ready.insert(fine, Arc::clone(columns)).is_some();
+        self.sync_sample(fine);
+        self.refresh_ready(fine, existed);
+    }
+    fn apply_detail(&mut self, (cx, cz): (i32, i32), columns: &ReducedColumns) {
+        self.apply_fine((cx, cz), &columns.columns);
+        let mut modified = Vec::new();
+        // A single generated chunk cannot describe a larger cell's area
+        // (strides over 16 blocks, levels over 4); level 0 was applied above.
+        // At each level up to 4, only the tile holding the chunk overlaps it.
+        for level in 1..=4u8 {
+            let size = 16 << level;
+            let key = TileKey {
+                x: (cx * 16).div_euclid(size),
+                z: (cz * 16).div_euclid(size),
+                level,
+            };
+            let Some(samples) = self.ready.get_mut(&key) else {
+                continue;
+            };
+            let [ox, _, oz] = key.origin();
+            let stride = key.size() / 16;
+            // What the far terrain thread should have ready next time.
+            self.shared
+                .detail_widths
+                .fetch_or(1 << (stride.trailing_zeros() - 1), Ordering::Relaxed);
+            let x0 = ((cx * 16 - ox + stride - 1).div_euclid(stride)).clamp(0, 16);
+            let x1 = (((cx + 1) * 16 - ox + stride - 1).div_euclid(stride)).clamp(0, 16);
+            let z0 = ((cz * 16 - oz + stride - 1).div_euclid(stride)).clamp(0, 16);
+            let z1 = (((cz + 1) * 16 - oz + stride - 1).div_euclid(stride)).clamp(0, 16);
+            if x0 == x1 || z0 == z1 {
+                continue;
+            }
+            let mask = self.detail_masks.entry(key).or_default();
+            let mut changed = 0usize;
+            let mut only_changed = 0usize;
+            let mut same_len = true;
+            for z in z0..z1 {
+                for x in x0..x1 {
+                    let index = (z * 16 + x) as usize;
+                    let col_spans = columns.get(
+                        (ox + x * stride).rem_euclid(16) as usize,
+                        (oz + z * stride).rem_euclid(16) as usize,
+                        stride as usize,
+                    );
+                    if !samples.column_matches(index, col_spans, None) {
+                        changed += 1;
+                        only_changed = index;
+                        if samples.spans(index).len() != col_spans.len() {
+                            same_len = false;
+                        }
+                    }
+                    mask[index / 64] |= 1 << (index % 64);
+                }
+            }
+            if changed > 0 {
+                // Release `mesh_samples`'s handle when no mesh snapshot shares
+                // its shard so unshared tiles can be patched in place;
+                // `sync_sample` re-inserts the handle right after the loop.
+                self.mesh_samples.release_if_unshared(key);
+                let patched = if let Some(tile) = Arc::get_mut(samples) {
+                    if changed == 1 {
+                        let x = (only_changed % 16) as i32;
+                        let z = (only_changed / 16) as i32;
+                        let col_spans = columns.get(
+                            (ox + x * stride).rem_euclid(16) as usize,
+                            (oz + z * stride).rem_euclid(16) as usize,
+                            stride as usize,
+                        );
+                        tile.patch_cell_no_surface(only_changed, col_spans);
+                        true
+                    } else if same_len {
+                        for z in z0..z1 {
+                            for x in x0..x1 {
+                                let index = (z * 16 + x) as usize;
+                                let col_spans = columns.get(
+                                    (ox + x * stride).rem_euclid(16) as usize,
+                                    (oz + z * stride).rem_euclid(16) as usize,
+                                    stride as usize,
+                                );
+                                if !tile.column_matches(index, col_spans, None) {
+                                    tile.patch_cell_no_surface(index, col_spans);
+                                }
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !patched {
+                    let updated = TileColumns::from_cells(CELLS * CELLS, |index| {
+                        let x = (index % 16) as i32;
+                        let z = (index / 16) as i32;
+                        if (x0..x1).contains(&x) && (z0..z1).contains(&z) {
+                            let col_spans = columns.get(
+                                (ox + x * stride).rem_euclid(16) as usize,
+                                (oz + z * stride).rem_euclid(16) as usize,
+                                stride as usize,
+                            );
+                            (col_spans, None)
+                        } else {
+                            (samples.spans(index), samples.surface(index))
+                        }
+                    });
+                    if let Some(tile) = Arc::get_mut(samples) {
+                        *tile = updated;
+                    } else {
+                        *samples = Arc::new(updated);
+                    }
+                }
+                modified.push(key);
+            }
+        }
+        for key in modified {
+            self.sync_sample(key);
+            self.mark_data_changed(key);
+        }
+    }
+    #[cfg(test)]
+    fn finish_sample(&mut self, key: TileKey, samples: Vec<Column>) {
+        let tile = (samples.len() == CELLS * CELLS).then(|| TileColumns::from_columns(&samples));
+        self.finish_tile(key, tile);
+    }
+    fn finish_tile(&mut self, key: TileKey, tile: Option<TileColumns>) {
+        self.pending.remove(&key);
+        let Some(tile) = tile.filter(|t| t.len() == CELLS * CELLS) else {
+            let now = std::time::Instant::now();
+            if self.retry.len() > 4096 {
+                self.retry.retain(|_, at| *at > now);
+            }
+            self.retry.insert(key, now + RETRY);
+            self.restale.remove(&key);
+            return;
+        };
+        self.retry.remove(&key);
+        if self.plan.nodes.contains(&key) {
+            let tile = match (self.ready.get(&key), self.detail_masks.get(&key)) {
+                (Some(old), Some(mask)) if mask.iter().any(|&bits| bits != 0) => {
+                    TileColumns::from_cells(CELLS * CELLS, |i| {
+                        if mask[i / 64] & (1 << (i % 64)) != 0 {
+                            (old.spans(i), old.surface(i))
+                        } else {
+                            (tile.spans(i), tile.surface(i))
+                        }
+                    })
+                }
+                _ => tile,
+            };
+            // Refreshed again meanwhile: sampled once more after this.
+            if self.restale.remove(&key) {
+                self.wanted_stale = true;
+            } else {
+                self.stale.remove(&key);
+            }
+            if self.ready.get(&key).is_some_and(|old| **old == tile) {
+                return;
+            }
+            let existed = self.ready.insert(key, Arc::new(tile)).is_some();
+            self.sync_sample(key);
+            self.refresh_ready(key, existed);
+        }
+    }
+    fn finish_detail(&mut self, key: (i32, i32), mut columns: ReducedColumns) {
+        if let Some(visited) = self.saved.get(&key).cloned()
+            && !Arc::ptr_eq(&visited, &columns.columns)
+        {
+            if *visited != *columns.columns {
+                // Its latest reduction is queued; never restore old edits or seed data.
+                self.apply_fine(key, &visited);
+                return;
+            }
+            // Equivalent content (e.g. `ServerTerrain` returning the same
+            // observed chunk for a newly-ready coarse tile): share `visited`
+            // so `reduced[key].columns` stays canonical and coarse bits update.
+            columns.columns = visited;
+        }
+        self.apply_detail(key, &columns);
+        if self.saved.contains_key(&key) {
+            self.reduced.insert(key, Arc::new(columns));
+        }
+        // `apply_detail` marks every tile whose columns it replaced, and their
+        // neighbours. Coarser tiles do not read visited columns (stride > 16),
+        // so re-meshing every tile touching the chunk was pure waste.
+    }
+    /// Arms the world-entry first-load hold (`FirstLoad::Waiting`) so far
+    /// terrain yields to the initial near load. Rebuilds in an already-loaded
+    /// world (shader pack changes, resource reloads, toggling far terrain on)
+    /// leave it unarmed.
+    pub fn arm_first_load(&mut self) {
+        self.first_load = FirstLoad::Waiting(std::time::Instant::now());
+    }
+    /// Whether the near terrain is still loading: far terrain then queues
+    /// `SAMPLE_JOBS` at most, and on small machines holds back
+    /// (`HELD_SAMPLE_STEP`).
+    pub fn set_near_loading(&mut self, loading: bool) {
+        self.first_load = self.first_load.step(loading, std::time::Instant::now());
+        if loading && !self.near_loading {
+            // The queue filled while nothing loaded nearby; the near chunks
+            // must not wait behind it. Larger machines keep its first
+            // `SAMPLE_JOBS`, small ones none, a first load (`limited`) one.
+            let mut keep = if self.small {
+                0
+            } else if self.limited() {
+                1
+            } else {
+                SAMPLE_JOBS
+            };
+            let dropped = drop_queued_samples(&self.shared, &mut self.pending, |_| {
+                let kept = keep > 0;
+                keep = keep.saturating_sub(1);
+                kept
+            });
+            // Sampled again from the queue: they read what `refresh` announced.
+            for key in &dropped {
+                self.restale.remove(key);
+            }
+            // Back in line where `wanted_tiles` put them: the near terrain can
+            // start and stop loading every few frames, and rebuilding the whole
+            // queue each time cost more than the samples it held back.
+            let camera = self.plan.camera;
+            self.wanted.extend(dropped.into_iter().map(|key| {
+                let class = if self.plan.split.contains(&key) {
+                    BACKDROP
+                } else if key.reach(camera) < self.plan.first {
+                    SEAM
+                } else {
+                    REST
+                };
+                std::cmp::Reverse(Wanted {
+                    class,
+                    distance: i64::from(key.distance(camera)),
+                    x: key.x,
+                    z: key.z,
+                    level: key.level,
+                })
+            }));
+            // A sample may still be running: the held pace starts from now.
+            self.held_sample_at = std::time::Instant::now();
+        }
+        self.near_loading = loading;
+        self.shared.near_loading.store(loading, Ordering::Relaxed);
+        let held = self.held();
+        if self.shared.mesh_held.swap(held, Ordering::Release) && !held {
+            self.shared.mesh_wake.notify_all();
+        }
+    }
+    /// On small machines, far work waits while the near terrain loads: one
+    /// sample job at a time (`HELD_SAMPLE_STEP`), no meshing and no detail.
+    fn held(&self) -> bool {
+        self.small && self.near_loading
+    }
+    /// Through a world entry's first near load (`FirstLoad`), on machines
+    /// with more than four threads (small ones keep `held`), far terrain keeps
+    /// about one thread: one far job in flight at a time, a sample or a mesh,
+    /// taking turns (`mesh_turn`), the nearest first, and no detail (no far
+    /// decoration).
+    fn limited(&self) -> bool {
+        !self.small && self.first_load.holding()
+    }
+    /// Far jobs queued or running: samples and meshes.
+    fn far_jobs_in_flight(&self) -> usize {
+        self.pending.len() + self.outstanding_meshes
+    }
+    fn request_detail(&mut self, camera: [i32; 2]) {
+        if self.held()
+            || self.limited()
+            || self.detail_request_pending
+            // Nothing new while summaries wait: a chunk whose detail is still
+            // in the backlog has its mask clear, so it would be asked for
+            // again, and answered from the cache at once. Without this the
+            // backlog grew by a request every 250 ms and never drained --
+            // 0.5 FPS, with `update` averaging 9.7 s a frame.
+            || !self.detail_backlog.is_empty()
+            || self.detail_request_at.elapsed() < std::time::Duration::from_millis(250)
+        {
+            return;
+        }
+        let mut keys: Vec<_> = self
+            .active
+            .iter()
+            .filter(|key| {
+                self.wants_detail(key) && self.detail_masks.get(key) != Some(&[u64::MAX; 4])
+            })
+            .copied()
+            .collect();
+        // Retiring fine columns are empty stand-ins, excluded from `active`
+        // while their normal meshes still cover the gap. Request their detail
+        // explicitly: neither the active-tile requests nor sampling an already
+        // ready stand-in can fill it, so its GPU sections would never retire.
+        // Not those whose summary is on its way: it is the column itself, and
+        // the source's detail could be drawn for a few frames before it.
+        keys.extend(retiring_detail(
+            &self.plan,
+            &self.retiring,
+            |column| self.summary_on_its_way(column),
+            &self.detail_masks,
+        ));
+        keys.sort_unstable_by_key(|key| (key.distance(camera), *key));
+        let mut chunks = FxHashSet::default();
+        for key in keys {
+            let [ox, _, oz] = key.origin();
+            let stride = key.size() / 16;
+            let mask = self.detail_masks.get(&key).copied().unwrap_or_default();
+            for index in 0..256 {
+                if mask[index / 64] & (1 << (index % 64)) == 0 {
+                    let chunk = (
+                        (ox + (index as i32 % 16) * stride).div_euclid(16),
+                        (oz + (index as i32 / 16) * stride).div_euclid(16),
+                    );
+                    // A retiring column's tile is drawn soon: it needs its detail.
+                    if self.full.contains(&chunk) {
+                        self.detail_masks.entry(key).or_default()[index / 64] |= 1 << (index % 64);
+                    } else {
+                        chunks.insert(chunk);
+                    }
+                }
+            }
+            if chunks.len() >= DETAIL_REQUEST {
+                break;
+            }
+        }
+        let mut chunks: Vec<_> = chunks.into_iter().collect();
+        chunks.sort_unstable_by_key(|&(x, z)| {
+            let dx = i64::from(x * 16 + 8 - camera[0]);
+            let dz = i64::from(z * 16 + 8 - camera[1]);
+            dx * dx + dz * dz
+        });
+        chunks.truncate(DETAIL_REQUEST);
+        if chunks.is_empty() {
+            self.detail_request_at = std::time::Instant::now();
+            return;
+        }
+        // As in `request_samples`: the far terrain threads take this lock too
+        // and run behind the render thread, so never stall a frame waiting for
+        // it. Busy now, leave `detail_request_at` untouched to retry next frame.
+        let mut jobs = match self.shared.jobs.try_lock() {
+            Ok(jobs) => jobs,
+            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        jobs.push_back(Job::RequestDetail {
+            chunks,
+            center: camera,
+            refreshes: self.refreshes,
+        });
+        drop(jobs);
+        self.detail_request_at = std::time::Instant::now();
+        self.detail_request_pending = true;
+        self.shared.wake.notify_all();
+    }
+    /// `aim` asks the tiles a zoomed view magnifies for finer detail
+    /// ([`ZoomAim`]); `None` plans exactly as before.
+    pub fn update(
+        &mut self,
+        camera: [f64; 3],
+        detail: i32,
+        distance: u32,
+        covered: Option<FxHashSet<(i32, i32)>>,
+        aim: Option<ZoomAim>,
+    ) -> Vec<(TileKey, SectionMesh)> {
+        let elevation =
+            (((camera[1] - f64::from(MIN_Y + crate::chunk::HEIGHT)).clamp(0., 16384.)) as i32 / 32)
+                * 32;
+        let camera = [camera[0].floor() as i32, camera[2].floor() as i32];
+        // Replan at chunk boundaries, not on every camera movement.
+        // `ZoomAim` rounds its yaw, so a zoom held still keeps one area and the
+        // quadtree is not rebuilt as the player nudges the mouse.
+        let area = (
+            [camera[0].div_euclid(16), camera[1].div_euclid(16)],
+            detail,
+            distance,
+            elevation,
+            self.reduced_detail,
+            aim,
+        );
+        if self.area != Some(area) {
+            crate::spans::time("lod_plan", || {
+                self.area = Some(area);
+                self.replan(camera, detail, distance, elevation, aim);
+            });
+        } else if self.kept.due() {
+            self.kept.trim();
+        }
+        let mut meshes = Vec::new();
+        crate::spans::time("lod_results", || self.receive(&mut meshes));
+        crate::spans::time("lod_retiring", || self.prune_retiring());
+        // Uploaded over frames in this order (`Renderer::upload_lods`): a
+        // tile is meshed clipped around its finer ones, so they go first,
+        // and the nearest first, where far terrain meets the near chunks.
+        meshes.sort_by_key(|(key, _)| (key.level, key.distance(camera)));
+        crate::spans::time("lod_covered", || self.cover(covered));
+        crate::spans::time("lod_return", || self.bring_back());
+        if std::mem::take(&mut self.reselect) {
+            self.rebuild_selection();
+        }
+        crate::spans::time("lod_request", || self.request_detail(camera));
+        crate::spans::time("lod_wanted", || self.request_samples(camera));
+        crate::spans::time("lod_dispatch", || self.dispatch_meshes(camera));
+        crate::spans::time("lod_removed", || self.release_removed());
+        self.publish_cutout_if_ready();
+        meshes
+    }
+    /// Rebuilds the quadtree and the selection it implies. Only runs when the
+    /// planned area changes (a chunk boundary), never per finished sample.
+    fn replan(
+        &mut self,
+        camera: [i32; 2],
+        detail: i32,
+        distance: u32,
+        elevation: i32,
+        aim: Option<ZoomAim>,
+    ) {
+        let plan = Plan::with_previous(
+            camera,
+            detail,
+            distance,
+            &self.plan,
+            elevation,
+            self.reduced_detail,
+            aim,
+        );
+        // A tile that leaves the range before it was drawn stops being
+        // unknown to its neighbours (`Snapshot::planned_leaf`): they remesh
+        // with walls against it, as against any terrain out of range.
+        let gone: Vec<_> = self
+            .plan
+            .nodes
+            .iter()
+            .filter(|key| !plan.nodes.contains(key) && !self.ready.contains_key(key))
+            .copied()
+            .collect();
+        self.plan = plan;
+        self.kept.fit_to_view(self.plan.nodes.len());
+        // Tiles leaving the plan are kept for a return, with their detail. Not
+        // stale ones (their source has more), nor ones of cells a chunk wide or
+        // less over the full-detail columns: never drawn there, they came back
+        // as flat grey ground around the near terrain until it loaded.
+        let leaving: Vec<_> = self
+            .ready
+            .keys()
+            .filter(|key| !self.plan.nodes.contains(key))
+            .copied()
+            .collect();
+        for key in leaving {
+            let columns = self.ready.remove(&key).unwrap();
+            if !self.stale.contains(&key) && !self.over_covered(key) {
+                let mask = self.detail_masks.get(&key).copied();
+                self.kept.keep(key, columns, mask);
+            }
+        }
+        self.kept.trim();
+        // Those the plan wants again come back (`bring_back`) instead of being
+        // sampled: a level at a time, coarsest first. Not at the seam with the
+        // near chunks (`Plan::stands_in`), sampled first and fresh there: kept
+        // ones drew grey ground and the near chunks' caves until they loaded.
+        let (returning, seam): (Vec<_>, Vec<_>) = self
+            .plan
+            .nodes
+            .iter()
+            .filter(|key| self.kept.contains(key) && !self.ready.contains_key(key))
+            .copied()
+            .partition(|key| self.plan.stands_in(*key));
+        for key in seam {
+            self.kept.take(&key);
+        }
+        self.returning = returning;
+        self.returned_at = std::time::Instant::now();
+        let nodes = &self.plan.nodes;
+        self.mesh_samples.retain(|key| nodes.contains(key));
+        // Queued tiles the view left are not sampled; a running one is dropped (`finish_sample`).
+        drop_queued_samples(&self.shared, &mut self.pending, |key| {
+            self.plan.nodes.contains(key)
+        });
+        self.stale.retain(|key| self.plan.nodes.contains(key));
+        self.restale.retain(|key| self.plan.nodes.contains(key));
+        self.detail_masks
+            .retain(|key, _| self.plan.nodes.contains(key));
+        let plan = &self.plan;
+        self.summary_asks
+            .retain(|&column| plan.needs_summary(column));
+        // Complete resident columns need no duplicate noise work.
+        let mut standins = Vec::new();
+        let mut empty_standin: Option<Arc<TileColumns>> = None;
+        for &key in &self.plan.by_level[0] {
+            if self.covered.contains(&(key.x, key.z)) && !self.ready.contains_key(&key) {
+                let standin = empty_standin.get_or_insert_with(TileColumns::empty).clone();
+                self.ready.insert(key, standin);
+                standins.push(key);
+            }
+        }
+        self.rebuild_selection();
+        for key in standins {
+            self.refresh_path(key);
+        }
+        for key in gone {
+            self.mark_side_neighbors_of(key);
+        }
+    }
+    /// Whether a tile of cells a chunk wide or less lies over a covered column.
+    fn over_covered(&self, key: TileKey) -> bool {
+        if key.size() > 16 * CELLS as i32 {
+            return false;
+        }
+        let [ox, _, oz] = key.origin();
+        let size = key.size();
+        if let Some([x0, z0, x1, z1]) = self.covered_bounds
+            && (ox >= x1 || oz >= z1 || ox + size <= x0 || oz + size <= z0)
+        {
+            return false;
+        }
+        let chunks = (size / 16).max(1);
+        (0..chunks * chunks).any(|i| {
+            self.covered.contains(&(
+                ox.div_euclid(16) + i % chunks,
+                oz.div_euclid(16) + i / chunks,
+            ))
+        })
+    }
+    /// Whether a tile at the seam with the near chunks (`Plan::stands_in`)
+    /// still waits for its samples.
+    fn seam_open(&self) -> bool {
+        self.plan.nodes.iter().any(|key| {
+            !self.plan.stands_in(*key)
+                && !self.plan.split.contains(key)
+                && !self.ready.contains_key(key)
+        })
+    }
+    /// Takes kept tiles back into the plan, the coarsest level first, the next
+    /// once the meshes are in: all of them at once left the sky showing
+    /// through every tile not meshed yet, where sampling fills a view coarse
+    /// first and refines it.
+    fn bring_back(&mut self) {
+        if self.returning.is_empty() || self.unmeshed.len() > RETURN_BACKLOG {
+            return;
+        }
+        let level = self
+            .returning
+            .iter()
+            .map(|key| key.level)
+            .max()
+            .unwrap_or(0);
+        if level <= RETURN_FINE_LEVEL
+            && self.returned_at.elapsed() < RETURN_SEAM_WAIT
+            && (self.near_loading || self.seam_open())
+        {
+            return;
+        }
+        let (now, later): (Vec<_>, Vec<_>) =
+            self.returning.drain(..).partition(|key| key.level == level);
+        self.returning = later;
+        // Tiles forgotten meanwhile (`refresh`) are sampled: the queue skipped them.
+        self.wanted_stale = true;
+        let mut returned = Vec::new();
+        for key in now {
+            if self.ready.contains_key(&key) || self.pending.contains(&key) {
+                continue;
+            }
+            if let Some((columns, mask)) = self.kept.take(&key) {
+                self.ready.insert(key, columns);
+                self.sync_sample(key);
+                if let Some(mask) = mask {
+                    self.detail_masks.insert(key, mask);
+                }
+                returned.push(key);
+            }
+        }
+        if returned.is_empty() {
+            return;
+        }
+        self.rebuild_selection();
+        for key in returned {
+            self.refresh_path(key);
+        }
+    }
+    /// Recomputes every active tile after a plan change, then marks only the
+    /// tiles whose selection changed (plus their neighbours).
+    fn rebuild_selection(&mut self) {
+        self.reselect = false;
+        let old = std::mem::take(&mut self.active);
+        self.complete.clear();
+        // The plan indexes nodes by level, children before parents. Plans
+        // built by tests may not; sort those once.
+        let keys: Vec<TileKey> = if self.plan.by_level.iter().any(|level| !level.is_empty()) {
+            self.plan.by_level.iter().flatten().copied().collect()
+        } else {
+            let mut keys: Vec<_> = self.plan.nodes.iter().copied().collect();
+            keys.sort_unstable_by_key(|key| (key.level, key.x, key.z));
+            keys
+        };
+        for key in keys {
+            let (complete, active) = self.evaluate(key);
+            self.complete.insert(key, complete);
+            if active {
+                self.active.insert(key);
+            }
+        }
+        self.mesh_version.retain(|key, _| self.active.contains(key));
+        self.shown_version
+            .retain(|key, _| self.active.contains(key));
+        self.dirty.retain(|key, _| self.active.contains(key));
+        self.meshed.retain(|key| self.active.contains(key));
+        self.unmeshed.retain(|key| self.active.contains(key));
+        let inactive_waiting: Vec<_> = self
+            .cutout_waiting
+            .iter()
+            .copied()
+            .filter(|key| !self.active.contains(key))
+            .collect();
+        for key in inactive_waiting {
+            self.transfer_cutout_wait(key);
+        }
+        self.removed_pending
+            .retain(|key| !self.active.contains(key));
+        let changed: Vec<_> = old.symmetric_difference(&self.active).copied().collect();
+        for &key in &changed {
+            self.sync_sample(key);
+            if old.contains(&key) && !self.active.contains(&key) {
+                self.cancel_mesh(key);
+                self.removed_pending.insert(key);
+                self.meshed.remove(&key);
+                self.dirty.remove(&key);
+            }
+            self.mark_selection_changed(key);
+        }
+        self.wanted_stale = true;
+    }
+    fn receive(&mut self, meshes: &mut Vec<(TileKey, SectionMesh)>) {
+        let started = std::time::Instant::now();
+        // What an earlier frame left, before anything new: a chunk's detail
+        // must not overtake the detail of a chunk that arrived before it.
+        while started.elapsed() < DETAIL_BUDGET {
+            let Some(summary) = self.detail_backlog.pop_front() else {
+                break;
+            };
+            self.apply_summary(summary);
+        }
+        while let Ok(done) = self.results.try_recv() {
+            match done {
+                Done::Detail(key, columns, asked) => self.take_summary(
+                    Summary::Detail(key, columns, asked),
+                    started.elapsed() < DETAIL_BUDGET,
+                ),
+                Done::Observed(key, columns) => self.take_summary(
+                    Summary::Observed(key, columns),
+                    started.elapsed() < DETAIL_BUDGET,
+                ),
+                Done::DetailRequested => self.detail_request_pending = false,
+                Done::Sample { key, tile } => self.finish_tile(key, tile),
+                Done::Mesh {
+                    key,
+                    version,
+                    mesh,
+                    canceled,
+                } => {
+                    self.outstanding_meshes = self.outstanding_meshes.saturating_sub(1);
+                    self.accept_mesh(key, version, mesh, canceled.load(Ordering::Acquire), meshes);
+                }
+                Done::MeshCanceled { key, version } => {
+                    self.outstanding_meshes = self.outstanding_meshes.saturating_sub(1);
+                    if self.mesh_version.get(&key) == Some(&version) {
+                        self.mesh_cancel.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+    /// Applies a summary while the frame has budget and nothing is already
+    /// waiting, else leaves it for a later frame.
+    fn take_summary(&mut self, summary: Summary, within_budget: bool) {
+        if within_budget && self.detail_backlog.is_empty() {
+            self.apply_summary(summary);
+        } else {
+            self.detail_backlog.push_back(summary);
+        }
+    }
+    /// A chunk's columns applied to the tiles over it.
+    ///
+    /// `refreshed_since` is tested here and not when the result arrives, so a
+    /// refresh over the chunk while the summary waited still drops it: it was
+    /// read before that refresh, and the tiles ask again with their bits
+    /// clear.
+    fn apply_summary(&mut self, summary: Summary) {
+        crate::spans::time("lod_detail", || match summary {
+            Summary::Detail(key, _, asked) if self.refreshed_since(key, asked) => {}
+            Summary::Detail(key, columns, _) => self.finish_detail(key, columns),
+            Summary::Observed(key, columns) => self.finish_observed(key, columns),
+        });
+    }
+    /// A finished mesh: shown when it is newer than what the tile shows now.
+    /// A result newer than the frame's current one is still useful while a
+    /// newer job is pending — re-marking a tile re-dirties its neighbours and
+    /// ancestors, so on a busy frontier the newest job is not the one that
+    /// arrives next, and accepting only it left tiles unmeshed with their
+    /// removals blocked.
+    fn accept_mesh(
+        &mut self,
+        key: TileKey,
+        version: u64,
+        mesh: SectionMesh,
+        canceled: bool,
+        meshes: &mut Vec<(TileKey, SectionMesh)>,
+    ) {
+        let newest = self.mesh_version.get(&key) == Some(&version);
+        if canceled
+            || !self.active.contains(&key)
+            || self
+                .shown_version
+                .get(&key)
+                .is_some_and(|shown| version <= *shown)
+        {
+            return;
+        }
+        self.shown_version.insert(key, version);
+        meshes.push((key, mesh));
+        self.meshed.insert(key);
+        // Only the newest revision settles the tile; an older one fills the
+        // frame and stays dirty, so the pending job still runs.
+        if newest {
+            self.mesh_cancel.remove(&key);
+            self.unmeshed.remove(&key);
+            self.cutout_waiting.remove(&key);
+        }
+    }
+    /// Takes the new full-detail columns, when they changed (`None`: not).
+    fn cover(&mut self, covered: Option<FxHashSet<(i32, i32)>>) {
+        if let Some(full) = covered
+            && self.full != full
+        {
+            let leaving: Vec<_> = self.full.difference(&full).copied().collect();
+            if !self.keeps_observed {
+                let plan = &self.plan;
+                self.summary_asks.extend(
+                    leaving
+                        .iter()
+                        .copied()
+                        .filter(|&column| plan.needs_summary(column)),
+                );
+            }
+            self.retiring.extend(leaving);
+            self.retiring.retain(|column| !full.contains(column));
+            self.summary_asks.retain(|column| !full.contains(column));
+            self.full = full;
+            self.leave_out();
+        }
+    }
+    /// Releases retiring columns whose replacement is ready, then leaves out
+    /// the full-detail and retiring columns: tiles touching a change remesh.
+    fn prune_retiring(&mut self) {
+        if self.retiring.is_empty() {
+            return;
+        }
+        let (plan, ready, masks) = (&self.plan, &self.ready, &self.detail_masks);
+        let keep: FxHashSet<_> = self
+            .retiring
+            .iter()
+            .copied()
+            .filter(|&column| {
+                // Keep a retiring column while its observed summary is still
+                // pending for a planned far tile, even if an earlier visit
+                // left a complete detail mask behind. A saved summary alone is
+                // not detail: the tile may still be the empty covered stand-in.
+                (plan.planned_leaf(column).is_some() && self.summary_on_its_way(column))
+                    || !plan.replaces(column, ready, |key| masks.get(&key) == Some(&[u64::MAX; 4]))
+            })
+            .collect();
+        if keep.len() != self.retiring.len() {
+            self.retiring = keep;
+            self.leave_out();
+        }
+    }
+    fn leave_out(&mut self) {
+        let covered: FxHashSet<_> = self.full.union(&self.retiring).copied().collect();
+        if *self.covered == covered {
+            return;
+        }
+        let added: Vec<_> = covered.difference(&self.covered).copied().collect();
+        let changes: Vec<_> = self
+            .covered
+            .symmetric_difference(&covered)
+            .copied()
+            .collect();
+        self.covered = Arc::new(covered);
+        self.covered_bounds = self.covered.iter().fold(None, |bounds, &(x, z)| {
+            Some(match bounds {
+                None => [x * 16, z * 16, (x + 1) * 16, (z + 1) * 16],
+                Some([x0, z0, x1, z1]) => [
+                    x0.min(x * 16),
+                    z0.min(z * 16),
+                    x1.max((x + 1) * 16),
+                    z1.max((z + 1) * 16),
+                ],
+            })
+        });
+        for &(x, z) in &changes {
+            self.invalidate_chunk(x, z);
+        }
+        let mut standins = Vec::new();
+        let mut empty_standin: Option<Arc<TileColumns>> = None;
+        for &(x, z) in &added {
+            let key = TileKey { x, z, level: 0 };
+            if self.plan.nodes.contains(&key) && !self.ready.contains_key(&key) {
+                let standin = empty_standin.get_or_insert_with(TileColumns::empty).clone();
+                self.ready.insert(key, standin);
+                standins.push(key);
+            }
+        }
+        for key in standins {
+            self.refresh_path(key);
+        }
+        for &(x, z) in &changes {
+            self.refresh_path(TileKey { x, z, level: 0 });
+        }
+        self.cutout_pending = Some(self.covered.clone());
+        // Every active tile whose mesh clips an old/new covered column is
+        // dirty now; the cutout waits for their replacement meshes, not for
+        // every later job.
+        self.cutout_waiting.extend(
+            self.dirty
+                .keys()
+                .filter(|key| self.active.contains(key))
+                .copied(),
+        );
+    }
+    /// A waiting tile that left the selection is replaced by its active
+    /// descendants; the cutout must wait for those meshes instead.
+    fn transfer_cutout_wait(&mut self, key: TileKey) {
+        if !self.cutout_waiting.remove(&key) {
+            return;
+        }
+        if key.level == 0 {
+            return;
+        }
+        let mut descendants = Vec::new();
+        self.collect_active_descendants(key, &mut descendants);
+        self.cutout_waiting.extend(
+            descendants
+                .into_iter()
+                .filter(|key| !self.meshed.contains(key)),
+        );
+    }
+    /// Publishes the pending cutout once every active tile that had to stop
+    /// clipping the changed columns has an accepted mesh.
+    fn publish_cutout_if_ready(&mut self) {
+        if self.cutout_pending.is_none() || !self.cutout_waiting.is_empty() {
+            return;
+        }
+        self.cutout = self.cutout_pending.take();
+    }
+    /// Releases tiles whose every overlapping replacement already has a mesh.
+    /// Quadtree tiles are nested or disjoint, so blocking is an ancestor test:
+    /// O(pending + unm meshed active) tree walks, not pending x active.
+    fn release_removed(&mut self) {
+        if self.removed_pending.is_empty() {
+            return;
+        }
+        let mut blocked = FxHashSet::default();
+        for &removed in &self.removed_pending {
+            let mut node = removed;
+            loop {
+                if self.active.contains(&node) && !self.meshed.contains(&node) {
+                    blocked.insert(removed);
+                    break;
+                }
+                if node.level >= MAX_LEVEL {
+                    break;
+                }
+                node = node.parent();
+            }
+        }
+        for &active in &self.unmeshed {
+            let mut node = active;
+            loop {
+                if self.removed_pending.contains(&node) {
+                    blocked.insert(node);
+                }
+                if node.level >= MAX_LEVEL {
+                    break;
+                }
+                node = node.parent();
+            }
+        }
+        let pending: Vec<_> = self.removed_pending.iter().copied().collect();
+        for key in pending {
+            if self.active.contains(&key) || blocked.contains(&key) {
+                continue;
+            }
+            self.removed_pending.remove(&key);
+            self.removed.push(key);
+        }
+        self.removed_pending
+            .retain(|key| !self.active.contains(key));
+    }
+    /// Queues every dirty active tile with a shared immutable snapshot. One
+    /// batch used to clone all maps and serialize the whole view on one worker.
+    fn dispatch_meshes(&mut self, camera: [i32; 2]) {
+        if self.dirty.is_empty() || self.held() {
+            return;
+        }
+        // Under load, let the pool drain and send one larger batch with one
+        // snapshot instead of rebuilding the snapshot 20 times a second.
+        if self.outstanding_meshes >= self.mesh_workers * 4 {
+            return;
+        }
+        let limited = self.limited();
+        if limited {
+            if self.far_jobs_in_flight() > 0 {
+                return;
+            }
+            // A sample goes next unless this mesh is dispatched.
+            self.mesh_turn = false;
+        }
+        let mut keys: Vec<(TileKey, u64)> = self
+            .dirty
+            .iter()
+            .filter(|(key, _)| self.active.contains(key) && self.ready.contains_key(key))
+            .map(|(&key, &version)| (key, version))
+            .collect();
+        if keys.is_empty() {
+            self.dirty.clear();
+            return;
+        }
+        if limited {
+            // The nearest tile alone, whatever its level, so the ring grows
+            // outward from the near terrain; the rest stay dirty.
+            let first = keys
+                .iter()
+                .copied()
+                .min_by_key(|(key, _)| (key.distance(camera), key.level, *key))
+                .expect("checked above");
+            keys = vec![first];
+        }
+        #[cfg(debug_assertions)]
+        self.check_mesh_samples();
+        // Build the COW snapshot and job batch before taking `shared.mesh_jobs`
+        // so the render thread holds the worker mutex only for heap pushes.
+        let snapshot = Arc::new(Snapshot {
+            samples: self.mesh_samples.clone(),
+            saved: self.saved.clone(),
+            reduced: self.reduced.clone(),
+            nodes: self.plan.nodes.clone(),
+            split: self.plan.split.clone(),
+        });
+        let covered = self.covered.clone();
+        let mut batch = Vec::with_capacity(keys.len());
+        let mut cancels = Vec::with_capacity(keys.len());
+        for (key, version) in keys {
+            let finer = self.finer_of(key);
+            let canceled = Arc::new(AtomicBool::new(false));
+            cancels.push((key, canceled.clone()));
+            // Screen-space urgency: nearer blocks cost more pixels per work.
+            let priority = i64::from(key.distance(camera)) * 16 / i64::from(key.size());
+            batch.push(MeshQueued {
+                priority,
+                order: version,
+                job: MeshJob {
+                    snapshot: snapshot.clone(),
+                    key,
+                    version,
+                    finer,
+                    covered: covered.clone(),
+                    bounds: self.covered_bounds,
+                    canceled,
+                },
+            });
+        }
+        let count = batch.len();
+        // As in `request_samples`: the far meshing threads run behind the render thread, so it
+        // never waits for this lock. Busy now, the dirty tiles stay dirty for the next frame.
+        {
+            let mut queued = match self.shared.mesh_jobs.try_lock() {
+                Ok(queued) => queued,
+                Err(std::sync::TryLockError::WouldBlock) => return,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            };
+            queued.extend(batch);
+        }
+        if limited {
+            let (active, ready) = (&self.active, &self.ready);
+            self.dirty
+                .retain(|key, _| active.contains(key) && ready.contains_key(key));
+            for (key, _) in &cancels {
+                self.dirty.remove(key);
+            }
+        } else {
+            self.dirty.clear();
+        }
+        for (key, canceled) in cancels {
+            self.mesh_cancel.insert(key, canceled);
+        }
+        self.outstanding_meshes += count;
+        self.shared.mesh_wake.notify_all();
+    }
+    /// Brings `mesh_samples` up to date for `key` after its `active` or `ready` changed.
+    fn sync_sample(&mut self, key: TileKey) {
+        let samples = self.ready.get(&key).filter(|_| self.active.contains(&key));
+        self.mesh_samples.set(key, samples);
+    }
+    /// `mesh_samples` holds every active tile's ready samples and nothing else (debug builds).
+    #[cfg(debug_assertions)]
+    fn check_mesh_samples(&self) {
+        let kept = self.mesh_samples.iter().count();
+        let mut want = 0;
+        for key in &self.active {
+            if let Some(columns) = self.ready.get(key) {
+                want += 1;
+                let got = self.mesh_samples.get(key);
+                assert!(
+                    got.is_some_and(|got| Arc::ptr_eq(got, columns)),
+                    "mesh samples of {key:?} out of date"
+                );
+            }
+        }
+        assert_eq!(
+            kept, want,
+            "mesh samples keep tiles no longer active or ready"
+        );
+    }
+    fn finer_of(&self, key: TileKey) -> Vec<TileKey> {
+        if !self.plan.split.contains(&key) {
+            return Vec::new();
+        }
+        let mut finer = Vec::new();
+        self.collect_active_descendants(key, &mut finer);
+        finer
+    }
+    fn collect_active_descendants(&self, key: TileKey, out: &mut Vec<TileKey>) {
+        for child in key.children() {
+            if !self.plan.nodes.contains(&child) {
+                continue;
+            }
+            if self.active.contains(&child) {
+                out.push(child);
+            }
+            if self.plan.split.contains(&child) {
+                self.collect_active_descendants(child, out);
+            }
+        }
+    }
+    fn request_samples(&mut self, camera: [i32; 2]) {
+        // Every sample slot busy: no tile can be requested this frame.
+        let free = if self.held() {
+            usize::from(
+                self.pending.is_empty() && self.held_sample_at.elapsed() >= HELD_SAMPLE_STEP,
+            )
+        } else if self.limited() {
+            // One far job at a time; a sampled tile is meshed before the next.
+            usize::from(
+                self.far_jobs_in_flight() == 0 && !(self.mesh_turn && !self.dirty.is_empty()),
+            )
+        } else {
+            // `SAMPLE_JOBS` while the near terrain loads, the full queue
+            // (`QUEUED_PER_SAMPLER` a thread) once it is in.
+            let slots = if self.near_loading {
+                SAMPLE_JOBS
+            } else {
+                self.sample_jobs
+            };
+            slots.saturating_sub(self.pending.len())
+        };
+        if free == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.held() {
+            self.held_sample_at = now;
+        }
+        // A tile whose sampling failed waits out `RETRY`; once it has, the
+        // queue is rebuilt so the tile is asked again.
+        let retrying = self.retry.len();
+        self.retry.retain(|_, at| *at > now);
+        if self.retry.len() != retrying {
+            self.wanted_stale = true;
+        }
+        // The queue is rebuilt when the view moves a chunk, not scanned and
+        // sorted on every frame.
+        let view = [camera[0].div_euclid(16), camera[1].div_euclid(16)];
+        if self.wanted_stale || self.wanted_at != Some(view) {
+            self.rebuild_wanted(camera);
+            self.wanted_at = Some(view);
+            self.wanted_stale = false;
+        }
+        let mut issued = 0;
+        // The far sampling threads take this lock too, and they run behind the render thread
+        // (`far_terrain_current`): one preempted while holding it kept a frame waiting for over
+        // 100 ms on a busy machine. Busy now, the requests go out next frame.
+        let mut jobs = match self.shared.jobs.try_lock() {
+            Ok(jobs) => jobs,
+            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        while issued < free {
+            let Some(std::cmp::Reverse(wanted)) = self.wanted.pop() else {
+                break;
+            };
+            let key = TileKey {
+                x: wanted.x,
+                z: wanted.z,
+                level: wanted.level,
+            };
+            // Final tiles and the backdrop only (`wanted_tiles`).
+            if self.pending.contains(&key)
+                || self.sampled(key)
+                || (self.plan.split.contains(&key) && wanted.class != BACKDROP)
+                || !self.plan.nodes.contains(&key)
+                || self.retry.contains_key(&key)
+                || self.kept.contains(&key)
+            {
+                continue;
+            }
+            self.pending.insert(key);
+            jobs.push_back(Job::Sample(key));
+            issued += 1;
+        }
+        drop(jobs);
+        if issued > 0 {
+            self.mesh_turn = self.limited();
+            self.shared.wake.notify_all();
+        }
+    }
+    /// Sampled, and not since `refresh`ed.
+    fn sampled(&self, key: TileKey) -> bool {
+        self.ready.contains_key(&key) && !self.stale.contains(&key)
+    }
+    fn rebuild_wanted(&mut self, camera: [i32; 2]) {
+        self.wanted.clear();
+        // A failed tile waits out its retry delay (`retry`) before it is asked again.
+        let retry = &self.retry;
+        self.wanted.extend(
+            wanted_tiles(&self.plan, &self.ready, &self.stale, camera)
+                .filter(|w| {
+                    !retry.contains_key(&TileKey {
+                        x: w.x,
+                        z: w.z,
+                        level: w.level,
+                    })
+                })
+                .map(std::cmp::Reverse),
+        );
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            samples: self
+                .active
+                .iter()
+                .filter_map(|key| self.ready.get(key).map(|columns| (*key, columns.clone())))
+                .collect(),
+            saved: self.saved.clone(),
+            reduced: self.reduced.clone(),
+            nodes: self.plan.nodes.clone(),
+            split: self.plan.split.clone(),
+        }
+    }
+    #[cfg(test)]
+    fn mesh(&self, key: TileKey) -> SectionMesh {
+        let finer = self.finer_of(key);
+        let input = self.snapshot().mesh_input(key, finer);
+        let columns = input.columns();
+        let edges = input.edges();
+        mesh::Mesher::default().mesh(
+            key,
+            &columns,
+            &self.covered,
+            self.covered_bounds,
+            self.context.as_deref().expect("test mesh context"),
+            &edges,
+            &input.finer,
+        )
+    }
+}
+impl Snapshot {
+    /// Actual visited columns at this cell, when a saved/observed chunk has
+    /// them. Sampled stand-ins are coarser.
+    fn visited_source(&self, wx: i32, wz: i32, width: i32) -> Option<ColumnSource> {
+        let key = (wx.div_euclid(16), wz.div_euclid(16));
+        if width == 1 {
+            self.saved.get(&key).map(|columns| {
+                ColumnSource::Saved(
+                    columns.clone(),
+                    (wz.rem_euclid(16) * 16 + wx.rem_euclid(16)) as u16,
+                )
+            })
+        } else if width <= 16 {
+            self.reduced.get(&key).map(|columns| {
+                ColumnSource::Reduced(
+                    columns.clone(),
+                    width as u8,
+                    wx.rem_euclid(16) as u16,
+                    wz.rem_euclid(16) as u16,
+                )
+            })
+        } else {
+            None
+        }
+    }
+    fn neighbor_source(&self, wx: i32, wz: i32) -> Option<(ColumnSource, i32)> {
+        for level in 0..=MAX_LEVEL {
+            let size = 16 << level;
+            let key = TileKey {
+                x: wx.div_euclid(size),
+                z: wz.div_euclid(size),
+                level,
+            };
+            // `samples` holds exactly the active tiles.
+            let Some(columns) = self.samples.get(&key) else {
+                continue;
+            };
+            let stride = 1 << level;
+            let [ox, _, oz] = key.origin();
+            let x = (wx - ox) / stride;
+            let z = (wz - oz) / stride;
+            let (sx, sz) = (ox + x * stride, oz + z * stride);
+            if let Some(column) = self.visited_source(sx, sz, stride) {
+                return Some((column, stride));
+            }
+            return Some((
+                ColumnSource::Tile(columns.clone(), (z * CELLS as i32 + x) as u16),
+                stride,
+            ));
+        }
+        None
+    }
+    /// Whether block column (wx, wz) lies in a planned tile that is not
+    /// split, whatever drew it (nothing, here): the finest planned tile
+    /// there. Past a split tile's out-of-range children, or past the plan,
+    /// there is no terrain to wait for.
+    fn planned_leaf(&self, wx: i32, wz: i32) -> bool {
+        (0..=MAX_LEVEL)
+            .map(|level| {
+                let size = 16 << level;
+                TileKey {
+                    x: wx.div_euclid(size),
+                    z: wz.div_euclid(size),
+                    level,
+                }
+            })
+            .find(|key| self.nodes.contains(key))
+            .is_some_and(|key| !self.split.contains(&key))
+    }
+    fn mesh_input(&self, key: TileKey, finer: Vec<TileKey>) -> MeshInput {
+        let stride = key.size() / CELLS as i32;
+        let [ox, _, oz] = key.origin();
+        let base = self
+            .samples
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(TileColumns::empty);
+        let overrides = std::array::from_fn(|index| {
+            let x = index % CELLS;
+            let z = index / CELLS;
+            self.visited_source(ox + x as i32 * stride, oz + z as i32 * stride, stride)
+        });
+        let neighbors = std::array::from_fn(|direction| {
+            let mut edge = Vec::new();
+            let mut offset = 0;
+            while offset < key.size() {
+                let (wx, wz) = match direction {
+                    0 => (ox - 1, oz + offset),
+                    1 => (ox + key.size(), oz + offset),
+                    2 => (ox + offset, oz - 1),
+                    _ => (ox + offset, oz + key.size()),
+                };
+                // Nothing drawn across the edge: still to come when planned,
+                // so no wall is drawn against it; empty past the plan.
+                let (column, neighbor_stride, unknown) = match self.neighbor_source(wx, wz) {
+                    Some((column, stride)) => (column, stride, false),
+                    None => (ColumnSource::Empty, stride, self.planned_leaf(wx, wz)),
+                };
+                let coordinate = if direction < 2 { wz } else { wx };
+                let width = (neighbor_stride - coordinate.rem_euclid(neighbor_stride))
+                    .min(key.size() - offset);
+                edge.push(EdgeSource {
+                    start: offset,
+                    end: offset + width,
+                    column,
+                    unknown,
+                });
+                offset += width;
+            }
+            edge
+        });
+        MeshInput {
+            base,
+            overrides,
+            neighbors,
+            finer,
+        }
+    }
+}
+impl Drop for Lod {
+    fn drop(&mut self) {
+        // Under each pool's own lock: a worker between its stop check and its
+        // wait must not miss the wake, or join() hangs.
+        let jobs = self.shared.jobs.lock();
+        let mesh_jobs = self.shared.mesh_jobs.lock();
+        self.shared.stop.store(true, Ordering::Relaxed);
+        drop(mesh_jobs);
+        drop(jobs);
+        self.shared.wake.notify_all();
+        self.shared.mesh_wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        for thread in self.mesh_threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+/// The columns of a tile's `detail_masks` entry that have their detail.
+fn detail_count(mask: &[u64; 4]) -> usize {
+    mask.iter().map(|bits| bits.count_ones() as usize).sum()
+}
+/// Removes the queued sample jobs `keep` rejects (in queue order, best
+/// first) and frees their slots; the tiles removed.
+fn drop_queued_samples(
+    shared: &Shared,
+    pending: &mut FxHashSet<TileKey>,
+    mut keep: impl FnMut(&TileKey) -> bool,
+) -> Vec<TileKey> {
+    let mut dropped = Vec::new();
+    shared.jobs.lock().unwrap().retain(|job| match job {
+        Job::Sample(key) if !keep(key) => {
+            pending.remove(key);
+            dropped.push(*key);
+            false
+        }
+        _ => true,
+    });
+    dropped
+}
+/// Whether `key` overlaps any chunk column in `covered`, rejecting tiles
+/// outside `bounds` in O(1) and probing the intersected chunk rectangle when
+/// smaller than `covered`.
+fn tile_overlaps_covered(
+    key: TileKey,
+    covered: &FxHashSet<(i32, i32)>,
+    bounds: Option<[i32; 4]>,
+) -> bool {
+    if covered.is_empty() {
+        return false;
+    }
+    let [ox, _, oz] = key.origin();
+    let size = key.size();
+    if let Some([bx0, bz0, bx1, bz1]) = bounds {
+        if !(ox < bx1 && oz < bz1 && ox + size > bx0 && oz + size > bz0) {
+            return false;
+        }
+        let cx0 = ox.max(bx0).div_euclid(16);
+        let cz0 = oz.max(bz0).div_euclid(16);
+        let cx1 = ((ox + size).min(bx1) - 1).div_euclid(16) + 1;
+        let cz1 = ((oz + size).min(bz1) - 1).div_euclid(16) + 1;
+        let area = i64::from(cx1 - cx0) * i64::from(cz1 - cz0);
+        if area <= covered.len() as i64 {
+            for cz in cz0..cz1 {
+                for cx in cx0..cx1 {
+                    if covered.contains(&(cx, cz)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    }
+    covered.iter().any(|&(cx, cz)| {
+        let x = cx * 16;
+        let z = cz * 16;
+        x < ox + size && x + 16 > ox && z < oz + size && z + 16 > oz
+    })
+}
+/// Fine retiring stand-ins need actual column detail before `Plan::replaces`
+/// can release their normal meshes. The caller keeps the usual detail-request
+/// budget and waits for the replacement mesh before changing cutout.
+/// `summarizing`: columns whose own summary is on its way, which completes
+/// their detail without a request.
+fn retiring_detail<'a>(
+    plan: &'a Plan,
+    retiring: &'a FxHashSet<(i32, i32)>,
+    summarizing: impl Fn((i32, i32)) -> bool + 'a,
+    masks: &'a FxHashMap<TileKey, [u64; 4]>,
+) -> impl Iterator<Item = TileKey> + 'a {
+    retiring.iter().filter_map(move |&(x, z)| {
+        let key = TileKey { x, z, level: 0 };
+        (plan.nodes.contains(&key)
+            && masks.get(&key) != Some(&[u64::MAX; 4])
+            && !summarizing((x, z)))
+        .then_some(key)
+    })
+}
+#[cfg(test)]
+mod tests {
+    /// A far column's surface comes from the finest tile sampled over it, its
+    /// water and biome with it; where that tile's cell is empty or there is no
+    /// finer tile, the coarser one answers, and nothing answers where no tile
+    /// is sampled. West and north of the origin count as their own tiles.
+    #[test]
+    fn a_far_columns_surface_is_the_finest_tile_sampled_over_it() {
+        let lake = Surface {
+            height: 63,
+            state: BlockStateId(5),
+            water: Some((70, BlockStateId(9))),
+            biome: 3,
+        };
+        let hills = Surface {
+            height: 90,
+            state: BlockStateId(1),
+            water: None,
+            biome: 7,
+        };
+        let column = |surface| Column {
+            surface,
+            spans: Spans::new(),
+        };
+        // A block-wide tile over x, z in -16..0, one cell of it holding the
+        // lake at (-3, -14); a tile of 2-block cells over -32..0 all hills.
+        let mut fine = vec![column(None); CELLS * CELLS];
+        fine[2 * CELLS + 13] = column(Some(lake));
+        let mut ready = FxHashMap::default();
+        ready.insert(
+            TileKey {
+                x: -1,
+                z: -1,
+                level: 0,
+            },
+            Arc::new(TileColumns::from_columns(&fine)),
+        );
+        ready.insert(
+            TileKey {
+                x: -1,
+                z: -1,
+                level: 1,
+            },
+            Arc::new(TileColumns::filled(&column(Some(hills)))),
+        );
+        assert_eq!(surface_in(&ready, -3, -14), Some(lake));
+        assert_eq!(
+            surface_in(&ready, -4, -14),
+            Some(hills),
+            "the fine cell is empty"
+        );
+        assert_eq!(
+            surface_in(&ready, -20, -5),
+            Some(hills),
+            "no fine tile there"
+        );
+        assert_eq!(surface_in(&ready, 5, 5), None, "nothing sampled east");
+    }
+
+    /// A spyglass or the zoom mod magnifies only what the narrowed view
+    /// covers, so `ZoomAim` asks for finer tiles there and nowhere else. Without
+    /// that cone the same request would reach the whole circle, which at the
+    /// measured quads a tile is gigabytes of vertices.
+    #[test]
+    fn a_zoomed_view_asks_for_finer_tiles_only_where_it_looks() {
+        // Yaw 0 looks toward +z (`view_vector`), ten times magnified.
+        let aim = ZoomAim::new(0.0, 7.0, 10.0).expect("a tenth of the field of view zooms");
+        // Capped, however far the zoom goes.
+        assert_eq!(aim.boost, MAX_ZOOM_BOOST);
+        let camera = [0, 0];
+        let tile = |x, z, level| TileKey { x, z, level };
+        // Straight ahead, far enough that the direction decides it.
+        assert!(aim.covers(tile(0, 8, 4), camera), "ahead");
+        // Behind, beside, and the opposite diagonal: the zoom does not
+        // magnify these, so they keep the plan they would have had.
+        assert!(!aim.covers(tile(0, -9, 4), camera), "behind");
+        assert!(!aim.covers(tile(8, 0, 4), camera), "beside");
+        assert!(!aim.covers(tile(-9, -9, 4), camera), "diagonally behind");
+        // A tile the camera stands in is in view whichever way it faces.
+        assert!(aim.covers(tile(0, 0, 4), camera), "underfoot");
+    }
+
+    /// A zoom too slight to change which level a tile wants is not worth
+    /// rebuilding the quadtree for, and an unzoomed view must plan exactly as
+    /// it did before this feature.
+    #[test]
+    fn a_slight_zoom_does_not_replan() {
+        assert_eq!(ZoomAim::new(0.0, 70.0, 1.0), None, "not zoomed");
+        assert_eq!(
+            ZoomAim::new(0.0, 60.0, 1.2),
+            None,
+            "a fifth is under one level"
+        );
+        assert!(ZoomAim::new(0.0, 35.0, 2.0).is_some(), "twice is worth it");
+        // Nothing finite comes of a broken field of view.
+        assert_eq!(ZoomAim::new(0.0, f32::NAN, 4.0), None);
+        assert_eq!(ZoomAim::new(0.0, 0.0, 4.0), None);
+        assert_eq!(ZoomAim::new(0.0, 70.0, f32::INFINITY), None);
+    }
+
+    /// The cone turns with the player, and its yaw is rounded so that a
+    /// mouse-twitch does not rebuild the quadtree: two aims within the
+    /// rounding step compare equal, and `Lod::update` replans on that.
+    #[test]
+    fn the_cone_turns_and_rounds_with_the_view() {
+        let camera = [0, 0];
+        let east = ZoomAim::new(-90.0, 7.0, 10.0).expect("zoomed");
+        let tile = |x, z| TileKey { x, z, level: 4 };
+        // Yaw -90 looks toward +x.
+        assert!(east.covers(tile(8, 0), camera), "ahead when facing +x");
+        assert!(!east.covers(tile(0, 8), camera), "+z is no longer ahead");
+        // Within the rounding step: the same aim, so no replan.
+        assert_eq!(ZoomAim::new(0.0, 7.0, 10.0), ZoomAim::new(1.0, 7.0, 10.0));
+        // Past it: a different aim, so the cone follows.
+        assert_ne!(ZoomAim::new(0.0, 7.0, 10.0), ZoomAim::new(20.0, 7.0, 10.0));
+    }
+
+    /// Inside the cone a tile splits further than it would unzoomed, and
+    /// outside it the plan is unchanged, tile for tile.
+    #[test]
+    fn the_plan_is_finer_ahead_and_untouched_behind() {
+        let camera = [0, 0];
+        let plain = Plan::with_previous(camera, 12, 256, &Plan::default(), 0, false, None);
+        let zoomed = Plan::with_previous(
+            camera,
+            12,
+            256,
+            &Plan::default(),
+            0,
+            false,
+            ZoomAim::new(0.0, 7.0, 10.0),
+        );
+        // Finer somewhere: the zoomed plan holds tiles the plain one split
+        // no further.
+        assert!(
+            zoomed.nodes.len() > plain.nodes.len(),
+            "zoomed {} tiles, plain {}",
+            zoomed.nodes.len(),
+            plain.nodes.len()
+        );
+        // Behind the camera the two agree. Tiles there are the same level in
+        // both, so every plain node well behind is still a node when zoomed.
+        let behind = |key: &&TileKey| {
+            let [_, _, oz] = key.origin();
+            oz + key.size() < -1024
+        };
+        let plain_behind: std::collections::BTreeSet<_> =
+            plain.nodes.iter().filter(behind).copied().collect();
+        let zoomed_behind: std::collections::BTreeSet<_> =
+            zoomed.nodes.iter().filter(behind).copied().collect();
+        assert!(!plain_behind.is_empty(), "nothing behind to compare");
+        assert_eq!(
+            plain_behind, zoomed_behind,
+            "the zoom changed the plan behind the player"
+        );
+    }
+
+    use super::*;
+    use crate::mesher::TerrainVertex;
+    #[test]
+    fn retiring_fine_stand_ins_request_detail_before_their_gpu_meshes_can_retire() {
+        let column = (12, 0);
+        let fine = TileKey {
+            x: 12,
+            z: 0,
+            level: 0,
+        };
+        let mut plan = Plan::default();
+        Arc::make_mut(&mut plan.nodes).insert(fine);
+        let ready: FxHashMap<TileKey, ()> = [(fine, ())].into_iter().collect();
+        let retiring = [column].into_iter().collect();
+        let mut masks = FxHashMap::default();
+        // A covered stand-in is ready, but empty: ordinary sampling skips it,
+        // and selection leaves it out of `active`. It cannot yet replace the
+        // old full-detail column, even though the near world has unloaded it.
+        assert!(!plan.replaces(column, &ready, |key| masks.get(&key)
+            == Some(&[u64::MAX; 4])));
+        assert_eq!(
+            retiring_detail(&plan, &retiring, |_| false, &masks).collect::<Vec<_>>(),
+            [fine]
+        );
+        // The existing RequestDetail -> apply_fine path marks complete detail;
+        // only then may selection retire it and publish the new mesh cutout.
+        masks.insert(fine, [u64::MAX; 4]);
+        assert!(
+            retiring_detail(&plan, &retiring, |_| false, &masks)
+                .next()
+                .is_none()
+        );
+        assert!(plan.replaces(column, &ready, |key| masks.get(&key)
+            == Some(&[u64::MAX; 4])));
+    }
+    #[test]
+    fn retiring_detail_requests_only_planned_columns_still_missing_detail() {
+        let fine = |x| TileKey { x, z: 0, level: 0 };
+        let mut plan = Plan::default();
+        Arc::make_mut(&mut plan.nodes).extend((0..4).map(fine));
+        Arc::make_mut(&mut plan.nodes).insert(fine(5));
+        let retiring = (0..5).map(|x| (x, 0)).collect();
+        let masks = [
+            (fine(2), [u64::MAX; 4]),
+            (fine(3), [u64::MAX, u64::MAX, u64::MAX, u64::MAX - 1]),
+        ]
+        .into_iter()
+        .collect();
+        let mut requested: Vec<_> =
+            retiring_detail(&plan, &retiring, |column| column == (1, 0), &masks).collect();
+        requested.sort_unstable();
+        // Complete detail needs no request, nor a column whose own summary
+        // is on its way. An unplanned retiree and a planned column that is
+        // not retiring must not consume the budget.
+        assert_eq!(requested, [fine(0), fine(3)]);
+    }
+    /// A near chunk is summarized when it leaves the full-detail area, not
+    /// when it arrives: its column is asked for once, and until its summary
+    /// is applied it asks the source for no detail.
+    #[test]
+    fn leaving_columns_ask_for_their_summary_and_wait_for_it() {
+        let mut lod = Lod::scheduler_for_test();
+        assert!(!lod.summarizes_arrivals());
+        let fine = TileKey {
+            x: 1,
+            z: 0,
+            level: 0,
+        };
+        let other = TileKey {
+            x: 3,
+            z: 0,
+            level: 0,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).extend([fine, other]);
+        lod.cover(Some([(1, 0), (2, 0)].into_iter().collect()));
+        assert!(
+            lod.take_summary_asks(OBSERVE_AHEAD).is_empty(),
+            "arrivals ask nothing"
+        );
+        lod.cover(Some([(2, 0)].into_iter().collect()));
+        assert!(lod.retiring.contains(&(1, 0)));
+        assert!(lod.summary_on_its_way((1, 0)));
+        assert_eq!(lod.take_summary_asks(OBSERVE_AHEAD), [(1, 0)]);
+        assert!(
+            lod.take_summary_asks(OBSERVE_AHEAD).is_empty(),
+            "asked once"
+        );
+        // Taken but not resident: the source's detail is asked for instead.
+        assert!(!lod.summary_on_its_way((1, 0)));
+        // Observed (as `Lod::observe` counts it): no detail until it is applied.
+        lod.summarizing.insert((1, 0), 1);
+        assert!(lod.summary_on_its_way((1, 0)));
+        lod.finish_observed(
+            (1, 0),
+            ReducedColumns::new(Arc::new(std::array::from_fn(|_| Column::default()))),
+        );
+        assert!(!lod.summary_on_its_way((1, 0)));
+        assert_eq!(lod.detail_masks.get(&fine), Some(&[u64::MAX; 4]));
+        // Back in the full-detail area before it was taken: nothing to ask.
+        lod.cover(Some([(2, 0), (3, 0)].into_iter().collect()));
+        lod.cover(Some([(2, 0)].into_iter().collect()));
+        assert!(lod.summary_on_its_way((3, 0)));
+        lod.cover(Some([(2, 0), (3, 0)].into_iter().collect()));
+        assert!(lod.take_summary_asks(OBSERVE_AHEAD).is_empty());
+    }
+    /// Leaving the same column a second time after a replan discarded its fine
+    /// tile and detail mask still restores the cached summary into the new
+    /// covered stand-in, so retiring sections do not wait indefinitely.
+    #[test]
+    fn revisiting_a_column_across_a_replan_restores_its_cached_summary() {
+        let mut lod = Lod::scheduler_for_test();
+        let column = (1, 0);
+        let fine = TileKey {
+            x: 1,
+            z: 0,
+            level: 0,
+        };
+        let columns = |height| {
+            ReducedColumns::new(Arc::new(std::array::from_fn(|_| {
+                Column::from_surface(Some(Surface {
+                    height,
+                    state: BlockStateId(1),
+                    water: None,
+                    biome: 0,
+                }))
+            })))
+        };
+        // First visit: cover, leave, summarize, and retire cleanly.
+        lod.replan([16, 0], 2, 32, 0, None);
+        assert!(lod.plan.nodes.contains(&fine));
+        lod.cover(Some([column].into_iter().collect()));
+        lod.cover(Some(FxHashSet::default()));
+        assert_eq!(lod.take_summary_asks(OBSERVE_AHEAD), [column]);
+        lod.summarizing.insert(column, 1);
+        lod.finish_observed(column, columns(70));
+        let saved_arc = Arc::clone(&lod.saved[&column]);
+        lod.prune_retiring();
+        assert!(!lod.retiring.contains(&column));
+        assert_eq!(lod.ready[&fine].surface(0).unwrap().height, 70);
+
+        // Replan far away and back: the fine tile and its detail mask are
+        // discarded while `saved` keeps the summary.
+        lod.replan([10_000, 0], 2, 32, 0, None);
+        assert!(!lod.ready.contains_key(&fine));
+        assert!(!lod.detail_masks.contains_key(&fine));
+        assert!(lod.saved.contains_key(&column));
+        lod.replan([16, 0], 2, 32, 0, None);
+        assert!(lod.plan.nodes.contains(&fine));
+
+        // Second visit: entering coverage creates an empty stand-in without a
+        // detail mask; leaving with the same unchanged terrain must reapply
+        // the cached summary and allow retirement.
+        lod.cover(Some([column].into_iter().collect()));
+        assert!(lod.ready[&fine].surface(0).is_none());
+        assert!(!lod.detail_masks.contains_key(&fine));
+        lod.cover(Some(FxHashSet::default()));
+        assert_eq!(lod.take_summary_asks(OBSERVE_AHEAD), [column]);
+        lod.summarizing.insert(column, 1);
+        lod.finish_observed(column, columns(70));
+        assert!(Arc::ptr_eq(&lod.saved[&column], &saved_arc));
+        assert_eq!(lod.detail_masks.get(&fine), Some(&[u64::MAX; 4]));
+        assert_eq!(lod.ready[&fine].surface(0).unwrap().height, 70);
+        lod.prune_retiring();
+        assert!(!lod.retiring.contains(&column));
+        assert!(!lod.covered.contains(&column));
+    }
+    /// Re-entering coverage leaves the previous detail mask intact; on the next
+    /// departure, `prune_retiring` must keep holding the column until its new
+    /// observed summary arrives instead of flashing the stale far silhouette.
+    #[test]
+    fn prune_retiring_waits_for_pending_summary_despite_existing_detail_mask() {
+        let mut lod = Lod::scheduler_for_test();
+        let column = (1, 0);
+        let fine = TileKey {
+            x: 1,
+            z: 0,
+            level: 0,
+        };
+        let columns = |height| {
+            ReducedColumns::new(Arc::new(std::array::from_fn(|_| {
+                Column::from_surface(Some(Surface {
+                    height,
+                    state: BlockStateId(1),
+                    water: None,
+                    biome: 0,
+                }))
+            })))
+        };
+        Arc::make_mut(&mut lod.plan.nodes).insert(fine);
+        lod.cover(Some([column].into_iter().collect()));
+        lod.cover(Some(FxHashSet::default()));
+        assert_eq!(lod.take_summary_asks(OBSERVE_AHEAD), [column]);
+        lod.summarizing.insert(column, 1);
+        lod.finish_observed(column, columns(70));
+        lod.prune_retiring();
+        assert!(!lod.retiring.contains(&column));
+        assert_eq!(lod.detail_masks.get(&fine), Some(&[u64::MAX; 4]));
+
+        // Re-enter and depart after an edit: the old detail mask is still
+        // complete, so retiring must wait for both the queued ask and the
+        // in-flight observation before releasing the column.
+        lod.cover(Some([column].into_iter().collect()));
+        lod.cover(Some(FxHashSet::default()));
+        lod.prune_retiring();
+        assert!(lod.retiring.contains(&column), "waiting on summary ask");
+        assert!(lod.covered.contains(&column));
+
+        assert_eq!(lod.take_summary_asks(OBSERVE_AHEAD), [column]);
+        lod.summarizing.insert(column, 1);
+        lod.prune_retiring();
+        assert!(
+            lod.retiring.contains(&column),
+            "waiting on in-flight summary"
+        );
+        assert!(lod.covered.contains(&column));
+
+        lod.finish_observed(column, columns(95));
+        lod.prune_retiring();
+        assert!(!lod.retiring.contains(&column));
+        assert!(!lod.covered.contains(&column));
+        assert_eq!(lod.ready[&fine].surface(0).unwrap().height, 95);
+    }
+    /// Out-of-plan departing columns are not asked for summaries, and in-plan
+    /// asks drain within the caller's budget while deferred columns remain held
+    /// for subsequent ticks (and drop cleanly if a later replan removes them).
+    #[test]
+    fn summary_asks_filter_out_of_plan_columns_and_drain_within_budget() {
+        let mut lod = Lod::scheduler_for_test();
+        let fine = |x| TileKey { x, z: 0, level: 0 };
+        let planned: Vec<(i32, i32)> = (0..10).map(|x| (x, 0)).collect();
+        let out_of_plan = (20, 0);
+        let too_coarse_tile = TileKey {
+            x: 0,
+            z: 1,
+            level: 5,
+        };
+        let too_coarse_col = (0, 32);
+        {
+            let nodes = Arc::make_mut(&mut lod.plan.nodes);
+            nodes.extend(planned.iter().map(|&(x, _)| fine(x)));
+            nodes.insert(too_coarse_tile);
+        }
+        let all: FxHashSet<_> = planned
+            .iter()
+            .copied()
+            .chain([out_of_plan, too_coarse_col])
+            .collect();
+        lod.cover(Some(all));
+        lod.cover(Some(FxHashSet::default()));
+
+        assert!(!lod.summary_on_its_way(out_of_plan));
+        assert!(!lod.summary_on_its_way(too_coarse_col));
+        for &col in &planned {
+            assert!(lod.summary_on_its_way(col));
+        }
+
+        // First tick hands off at most `OBSERVE_AHEAD` columns; deferred ones
+        // stay queued and held in `retiring` without falling back to detail.
+        let first = lod.take_summary_asks(OBSERVE_AHEAD);
+        assert_eq!(first.len(), OBSERVE_AHEAD);
+        let first_set: FxHashSet<_> = first.iter().copied().collect();
+        assert_eq!(first_set.len(), OBSERVE_AHEAD);
+        let deferred: Vec<_> = planned
+            .iter()
+            .copied()
+            .filter(|col| !first_set.contains(col))
+            .collect();
+        assert_eq!(deferred.len(), 2);
+        for &col in &deferred {
+            assert!(lod.summary_on_its_way(col));
+        }
+        lod.prune_retiring();
+        for &col in &deferred {
+            assert!(lod.retiring.contains(&col), "deferred column stays held");
+        }
+        assert!(
+            retiring_detail(
+                &lod.plan,
+                &lod.retiring,
+                |col| lod.summary_on_its_way(col),
+                &lod.detail_masks,
+            )
+            .all(|key| !deferred.contains(&(key.x, key.z)))
+        );
+
+        // If one deferred column leaves the plan before the next tick, it is
+        // skipped and only the still-planned column is handed off.
+        Arc::make_mut(&mut lod.plan.nodes).remove(&fine(deferred[0].0));
+        let second = lod.take_summary_asks(OBSERVE_AHEAD);
+        assert_eq!(second, [deferred[1]]);
+        assert!(lod.take_summary_asks(OBSERVE_AHEAD).is_empty());
+        assert!(!lod.summary_on_its_way(deferred[0]));
+    }
+    /// A server's kept terrain is the summaries: every arriving chunk is
+    /// summarized as before, and nothing is asked when one leaves.
+    #[test]
+    fn sources_keeping_summaries_summarize_arrivals() {
+        let mut lod = Lod::scheduler_for_test();
+        lod.keeps_observed = true;
+        assert!(lod.summarizes_arrivals());
+        lod.cover(Some([(1, 0)].into_iter().collect()));
+        lod.cover(Some(FxHashSet::default()));
+        assert!(lod.take_summary_asks(OBSERVE_AHEAD).is_empty());
+    }
+    #[test]
+    fn reduced_far_detail_only_merges_tiles_away_from_the_near_terrain() {
+        let leaves = |plan: &Plan| {
+            plan.nodes
+                .iter()
+                .filter(|k| !plan.split.contains(k))
+                .count()
+        };
+        for camera in [[0, 0], [100, -40]] {
+            for distance in [64, 128, 512, 1024] {
+                let full = Plan::new(camera, 12, distance);
+                let reduced =
+                    Plan::with_previous(camera, 12, distance, &Plan::default(), 0, true, None);
+                // Never finer than Full anywhere, and as fine next to the
+                // full-detail area, whose edge the finest tiles match.
+                assert!(reduced.split.is_subset(&full.split));
+                assert_eq!(reduced.roots, full.roots);
+                for key in reduced.nodes.iter().filter(|k| !reduced.split.contains(k)) {
+                    if key.distance(camera) < 12 * 16 + 16 {
+                        assert_eq!(key.level, 0, "{key:?}");
+                    }
+                }
+                let (full, reduced) = (leaves(&full), leaves(&reduced));
+                // At 64 chunks most tiles are the near area's finest, the
+                // same in both: about half there, well under from 128.
+                let bound = if distance == 64 { full * 21 / 20 } else { full };
+                assert!(
+                    reduced * 2 < bound,
+                    "{reduced} of {full} tiles at {distance}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn far_plan_is_bounded_and_near_tiles_align_with_chunks() {
+        for camera in [[0, 0], [-1, -17], [1023, -4097]] {
+            for distance in [64, 256, 1024] {
+                let plan = Plan::new(camera, 12, distance);
+                assert!(plan.nodes.len() < 12000, "{} nodes", plan.nodes.len());
+                assert!(plan.roots.iter().all(|key| key.level <= MAX_LEVEL));
+                for key in plan.nodes.iter() {
+                    if !plan.split.contains(key) && key.distance(camera) < 12 * 16 {
+                        assert_eq!(key.level, 0);
+                    }
+                }
+                let cells = plan
+                    .nodes
+                    .iter()
+                    .filter(|k| !plan.split.contains(k))
+                    .count();
+                assert!(cells < 10000);
+            }
+        }
+        assert_eq!(
+            TileKey {
+                x: -1,
+                z: -2,
+                level: 1
+            }
+            .origin(),
+            [-32, 0, -64]
+        );
+    }
+    #[test]
+    fn world_wide_plans_stay_small_and_cover_every_level() {
+        // About 10 000 nodes at a corner of the world, 9 000 at its centre.
+        const WORLD_PLAN_NODES: usize = 16_384;
+        for (camera, elevation) in [
+            ([0, 0], 0),
+            ([115, 135], 49_000_000),
+            ([-30_000_000, 29_999_000], 90),
+        ] {
+            let plan = Plan::with_previous(
+                camera,
+                12,
+                MAX_CHUNKS,
+                &Plan::default(),
+                elevation,
+                false,
+                None,
+            );
+            let reduced = Plan::with_previous(
+                camera,
+                12,
+                MAX_CHUNKS,
+                &Plan::default(),
+                elevation,
+                true,
+                None,
+            );
+            let top = plan.nodes.iter().map(|k| k.level).max().unwrap();
+            assert_eq!(top, MAX_LEVEL, "{camera:?} y={elevation}: roots stop short");
+            assert!(
+                plan.nodes.len() < WORLD_PLAN_NODES,
+                "{camera:?} y={elevation}: {} nodes",
+                plan.nodes.len()
+            );
+            assert!(
+                reduced.nodes.len() <= plan.nodes.len(),
+                "{camera:?} y={elevation}: reduced has {} nodes, full {}",
+                reduced.nodes.len(),
+                plan.nodes.len()
+            );
+            // Every level from the finest planned one up to the roots has tiles.
+            let finest = plan.nodes.iter().map(|k| k.level).min().unwrap();
+            for level in finest..=MAX_LEVEL {
+                assert!(
+                    plan.nodes.iter().any(|k| k.level == level),
+                    "{camera:?} y={elevation}: no level-{level} tile"
+                );
+            }
+        }
+    }
+    #[test]
+    fn aerial_distance_avoids_unseen_full_detail_outside_the_near_area() {
+        let ground = Plan::new([0, 0], 12, 1024);
+        let high = Plan::with_previous([0, 0], 12, 1024, &Plan::default(), 1024, false, None);
+        assert!(high.nodes.len() < ground.nodes.len());
+        assert!(
+            high.nodes.contains(&TileKey {
+                x: 0,
+                z: 0,
+                level: 0
+            }),
+            "near full-detail footprint stays exact"
+        );
+        assert!(
+            !high.nodes.contains(&TileKey {
+                x: 20,
+                z: 0,
+                level: 0
+            }),
+            "far terrain viewed from high above needs distance-appropriate detail"
+        );
+    }
+    #[test]
+    fn late_parent_keeps_ready_detail_and_only_fills_missing_children() {
+        let parent = TileKey {
+            x: -1,
+            z: 0,
+            level: 1,
+        };
+        let mut plan = Plan::default();
+        plan.roots.push(parent);
+        Arc::make_mut(&mut plan.nodes).insert(parent);
+        Arc::make_mut(&mut plan.split).insert(parent);
+        Arc::make_mut(&mut plan.nodes).extend(parent.children());
+        let mut ready: FxHashMap<TileKey, Vec<Column>> = FxHashMap::default();
+        ready.insert(parent, vec![]);
+        ready.insert(parent.children()[0], vec![]);
+        let mut selected = Vec::new();
+        ready.remove(&parent);
+        assert!(!plan.select(parent, &ready, &mut selected));
+        assert_eq!(selected, [parent.children()[0]]);
+        ready.insert(parent, vec![]);
+        selected.clear();
+        assert!(plan.select(parent, &ready, &mut selected));
+        assert_eq!(selected, [parent.children()[0], parent]);
+        for child in parent.children() {
+            ready.insert(child, vec![]);
+        }
+        selected.clear();
+        assert!(plan.select(parent, &ready, &mut selected));
+        assert_eq!(selected, parent.children());
+    }
+    #[test]
+    fn a_shrunk_render_distance_keeps_columns_until_their_planned_tiles_are_ready() {
+        // Render distance 64 under LOD 64: every tile inside it is a level-0
+        // stand-in for a covered column, and only the roots are sampled.
+        let camera = [8, 8];
+        let before = Plan::new(camera, 64, 64);
+        let after = Plan::with_previous(camera, 8, 64, &before, 0, false, None);
+        let mut ready: FxHashMap<TileKey, ()> = before
+            .nodes
+            .iter()
+            .filter(|key| key.level == 0 || before.roots.contains(key))
+            .map(|&key| (key, ()))
+            .collect();
+        ready.retain(|key, _| after.nodes.contains(key));
+        let contains = |key: &TileKey, (x, z): (i32, i32)| {
+            let [ox, _, oz] = key.origin();
+            (ox..ox + key.size()).contains(&(x * 16)) && (oz..oz + key.size()).contains(&(z * 16))
+        };
+        // 24 chunks out, now past the render distance: its planned tile was
+        // split before, so never sampled. The ready root reaches the seam, so
+        // it stands in for nothing: the column stays until its tile is in.
+        let column = (24, 0);
+        let mut selected = Vec::new();
+        for &root in &after.roots {
+            after.select(root, &ready, &mut selected);
+        }
+        assert!(!selected.iter().any(|key| contains(key, column)));
+        assert!(!after.replaces(column, &ready, |_| true));
+        let planned = TileKey {
+            x: 12,
+            z: 0,
+            level: 1,
+        };
+        assert!(after.nodes.contains(&planned) && before.split.contains(&planned));
+        ready.insert(planned, ());
+        assert!(after.replaces(column, &ready, |_| true));
+        // 12 chunks out, its level-0 tile is the stand-in until filled.
+        assert!(!after.replaces((12, 0), &ready, |_| false));
+        assert!(after.replaces((12, 0), &ready, |_| true));
+        // Past the far terrain nothing waits.
+        assert!(after.replaces((100, 0), &ready, |_| false));
+    }
+    #[test]
+    fn detail_survives_movement_across_a_split_threshold() {
+        let before = Plan::new([0, 0], 2, 256);
+        let after = Plan::with_previous([16, 0], 2, 256, &before, 0, false, None);
+        let mut retained = 0;
+        let range = i64::from(256 * 16);
+        for key in before.split.iter() {
+            if key.distance([16, 0]) < key.size() * 10 && key.reach([16, 0]) <= range * range {
+                assert!(after.split.contains(key));
+                retained += 1;
+            }
+        }
+        assert!(retained > 100);
+        assert!(after.nodes.len() < 16000);
+    }
+    #[test]
+    fn a_split_tile_stays_split_a_little_past_the_detail_ring() {
+        // Detail 40 puts the ring of full detail at 656 blocks, past where
+        // level 2 tiles split by their width (8 * 64 = 512): the ring alone
+        // splits this one, 640 blocks away.
+        let tile = TileKey {
+            x: 10,
+            z: 0,
+            level: 2,
+        };
+        let before = Plan::new([0, 0], 40, 256);
+        assert!(before.split.contains(&tile));
+        // 670 blocks: past the ring, inside 5% of it.
+        let held = Plan::with_previous([-30, 0], 40, 256, &before, 0, false, None);
+        assert!(held.split.contains(&tile));
+        // Not held without having been split: it was never in the ring.
+        assert!(!Plan::new([-30, 0], 40, 256).split.contains(&tile));
+        // 700 blocks: past the margin.
+        let gone = Plan::with_previous([-60, 0], 40, 256, &before, 0, false, None);
+        assert!(!gone.split.contains(&tile));
+    }
+    #[test]
+    fn reduced_material_votes_ignore_light_and_retain_exposure() {
+        let mut columns: [Column; 256] = std::array::from_fn(|_| Column::default());
+        for i in 0..16 {
+            columns[(i / 4) * 16 + i % 4].spans.push(Span {
+                min: 60,
+                max: 64,
+                state: BlockStateId(if i < 10 { 2 } else { 1 }),
+                biome: 0,
+                light: if i < 10 { (i as u16 + 6) << 4 } else { 0 },
+            });
+        }
+        let coarse = Column::reduced(&columns, 0, 0, 4);
+        assert_eq!(coarse.spans.len(), 1);
+        assert_eq!(
+            coarse.spans[0].state,
+            BlockStateId(2),
+            "majority grass must beat dark dirt"
+        );
+        assert_eq!(coarse.spans[0].light, 240, "retain sampled sky exposure");
+        for column in &mut columns {
+            for span in &mut column.spans {
+                span.light = 0;
+            }
+        }
+        assert_eq!(
+            Column::reduced(&columns, 0, 0, 4).spans[0].light,
+            0,
+            "unlit caves stay unlit"
+        );
+        columns[0].spans[0].light = 7 << 12;
+        assert_eq!(
+            Column::reduced(&columns, 0, 0, 4).spans[0].light,
+            7 << 12,
+            "block light does not invent skylight"
+        );
+    }
+    #[test]
+    fn nearly_full_blocks_are_kept() {
+        assert!(nearly_full("minecraft:powder_snow"));
+        assert!(nearly_full("minecraft:dirt_path"));
+        assert!(nearly_full("minecraft:oak_stairs"));
+        assert!(nearly_full("minecraft:oak_fence"));
+        assert!(!nearly_full("minecraft:wheat"));
+    }
+    #[test]
+    fn kelp_to_the_surface_is_drawn_as_water() {
+        // 0 air, 1 stone, 2 water, 3 kelp (holds water, draws as none).
+        let kinds = [AIR, KEPT, KEPT | FLUID, KEPT | FLUID | WATERY];
+        let mut chunk = Chunk::empty(0, 0);
+        for x in [3, 4] {
+            for y in MIN_Y..40 {
+                chunk.set(x, y, 3, 1);
+            }
+        }
+        for y in 40..63 {
+            chunk.set(3, y, 3, 3);
+            chunk.set(4, y, 3, 2);
+        }
+        let water = water_source(&kinds);
+        assert_eq!(water, Some(BlockStateId(2)));
+        let kelp = Column::from_chunk(&chunk, &kinds, water, 3, 3);
+        let sea = Column::from_chunk(&chunk, &kinds, water, 4, 3);
+        assert_eq!(kelp.spans, sea.spans);
+        assert_eq!(
+            kelp.spans.last().map(|s| (s.min, s.max, s.state)),
+            Some((40, 63, BlockStateId(2)))
+        );
+        assert_eq!(kelp.surface.unwrap().water, Some((63, BlockStateId(2))));
+        assert_eq!(kelp.surface.unwrap().height, 40);
+    }
+    #[test]
+    fn coarse_voxels_keep_what_any_column_holds_so_crowns_stay_on_trunks() {
+        let span = |min, max, state| Span {
+            min,
+            max,
+            state: BlockStateId(state),
+            biome: 0,
+            light: 240,
+        };
+        let mut columns = std::array::from_fn(|_| Column {
+            surface: None,
+            spans: vec![span(0, 4, 1)].into(),
+        });
+        // One trunk column under a crown over the whole footprint.
+        columns[0].spans.push(span(4, 12, 2));
+        for z in 0..4 {
+            for x in 0..4 {
+                columns[z * 16 + x].spans.push(span(12, 14, 3));
+            }
+        }
+        assert_eq!(
+            Column::reduced(&columns, 0, 0, 4).spans,
+            [span(0, 4, 1), span(4, 12, 2), span(12, 14, 3)]
+        );
+        assert_eq!(Column::reduced(&columns, 0, 0, 1), columns[0]);
+        let reduced = ReducedColumns::new(Arc::new(columns));
+        assert_eq!(
+            reduced.get(0, 0, 4),
+            [span(0, 4, 1), span(4, 12, 2), span(12, 14, 3)]
+        );
+        assert_eq!(reduced.get(4, 8, 4), [span(0, 4, 1)]);
+        assert_eq!(
+            reduced.get(0, 0, 16),
+            [span(0, 4, 1), span(4, 12, 2), span(12, 14, 3)],
+            "a crown over one corner of a wide cell still sits on its trunk"
+        );
+    }
+    /// A chunk is reduced to the one cell width that reads it, when it does.
+    ///
+    /// Reducing to all four widths up front cost 405 us of a far terrain
+    /// thread for every chunk the world sent, where at most one is read.
+    #[test]
+    fn a_chunk_is_reduced_only_to_the_width_that_reads_it() {
+        let built = |reduced: &ReducedColumns| {
+            reduced
+                .levels
+                .iter()
+                .enumerate()
+                .filter(|(_, level)| level.get().is_some())
+                .map(|(level, _)| 2usize << level)
+                .collect::<Vec<_>>()
+        };
+        let reduced = ReducedColumns::new(Arc::new(std::array::from_fn(|i| Column {
+            surface: None,
+            spans: vec![Span {
+                min: 0,
+                max: 4 + (i % 3) as i16,
+                state: BlockStateId(1),
+                biome: 0,
+                light: 240,
+            }]
+            .into(),
+        })));
+        assert!(built(&reduced).is_empty(), "nothing is reduced unread");
+        // A tile of full-detail cells reads the chunk's own columns.
+        reduced.get(3, 5, 1);
+        assert!(built(&reduced).is_empty());
+        reduced.get(4, 8, 4);
+        assert_eq!(built(&reduced), [4]);
+        // Read again, and the reduction is the one already built.
+        reduced.get(0, 0, 4);
+        assert_eq!(built(&reduced), [4]);
+        reduced.get(0, 0, 16);
+        assert_eq!(built(&reduced), [4, 16]);
+    }
+    /// A summary past a frame's budget waits for a later frame rather than
+    /// being dropped, and no new detail is asked for while any waits.
+    ///
+    /// Without the second part the backlog grew by a `DETAIL_REQUEST` every
+    /// 250 ms and never drained: a chunk whose summary is still waiting has
+    /// its detail mask clear, so it was asked for again and the cache
+    /// answered at once. That measured 0.5 FPS, `update` averaging 9.7 s.
+    #[test]
+    fn a_summary_past_the_budget_waits_and_holds_back_the_next_request() {
+        let mut lod = Lod::scheduler_for_test();
+        let chunk = (3, 5);
+        let columns = || ReducedColumns::new(Arc::new(std::array::from_fn(|_| Column::default())));
+
+        // Within budget and with nothing waiting, a summary applies at once.
+        lod.take_summary(Summary::Observed(chunk, columns()), true);
+        assert!(lod.detail_backlog.is_empty(), "applied, not deferred");
+        assert!(lod.saved.contains_key(&chunk), "and it reached `saved`");
+
+        // Past the budget it waits, and anything after it waits behind it so
+        // a chunk's detail cannot overtake a chunk that arrived earlier.
+        lod.take_summary(Summary::Observed((9, 9), columns()), false);
+        lod.take_summary(Summary::Observed((10, 9), columns()), true);
+        assert_eq!(
+            lod.detail_backlog.len(),
+            2,
+            "the second waits behind the first"
+        );
+        assert!(!lod.saved.contains_key(&(9, 9)));
+
+        // Nothing new is asked for while summaries wait, whatever the
+        // request interval allows. Asserted on `detail_request_at`, which
+        // `request_detail` records once it is past its guards: a test
+        // scheduler has no active tile wanting detail, so `pending` would
+        // stay false either way and prove nothing.
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        lod.detail_request_at = long_ago;
+        lod.detail_request_pending = false;
+        lod.request_detail([0, 0]);
+        assert_eq!(lod.detail_request_at, long_ago, "held back by the backlog");
+
+        // A later frame applies what waited, in the order it arrived.
+        while let Some(summary) = lod.detail_backlog.pop_front() {
+            lod.apply_summary(summary);
+        }
+        assert!(lod.saved.contains_key(&(9, 9)), "nothing was dropped");
+        assert!(lod.saved.contains_key(&(10, 9)));
+
+        // Drained, requests resume.
+        lod.detail_request_at = long_ago;
+        lod.request_detail([0, 0]);
+        assert!(
+            lod.detail_request_at > long_ago,
+            "asked once the backlog drained"
+        );
+    }
+    /// `warm` builds exactly the levels asked for, off the render thread, and
+    /// `get` then finds them built.
+    #[test]
+    fn warming_builds_the_levels_asked_for_and_no_others() {
+        let built = |reduced: &ReducedColumns| {
+            reduced
+                .levels
+                .iter()
+                .enumerate()
+                .filter(|(_, level)| level.get().is_some())
+                .map(|(level, _)| 2usize << level)
+                .collect::<Vec<_>>()
+        };
+        let chunk = || {
+            Arc::new(std::array::from_fn::<Column, 256, _>(|i| Column {
+                surface: None,
+                spans: vec![Span {
+                    min: 0,
+                    max: 4 + (i % 3) as i16,
+                    state: BlockStateId(1),
+                    biome: 0,
+                    light: 240,
+                }]
+                .into(),
+            }))
+        };
+        // No bits: nothing is built, as before.
+        assert!(built(&ReducedColumns::new(chunk()).warm(0)).is_empty());
+        // Widths 2 and 8 are levels 0 and 2.
+        let warmed = ReducedColumns::new(chunk()).warm(0b101);
+        assert_eq!(built(&warmed), [2, 8]);
+        // Reading a warmed width builds nothing more; an unwarmed one does.
+        warmed.get(0, 0, 2);
+        warmed.get(6, 6, 8);
+        assert_eq!(built(&warmed), [2, 8], "already built");
+        warmed.get(0, 0, 4);
+        assert_eq!(built(&warmed), [2, 4, 8]);
+        // Warming is the same reduction as reading would have made.
+        let lazy = ReducedColumns::new(chunk());
+        for (x, z, width) in [(0, 0, 2), (6, 6, 8), (4, 8, 4), (0, 0, 16)] {
+            assert_eq!(
+                warmed.get(x, z, width),
+                lazy.get(x, z, width),
+                "width {width} at {x},{z}"
+            );
+        }
+    }
+    /// Applying a chunk's detail records the cell widths it read, so the far
+    /// terrain thread reduces them before it sends the next chunk.
+    #[test]
+    fn applying_detail_records_the_widths_it_read() {
+        let mut lod = Lod::scheduler_for_test();
+        assert_eq!(lod.shared.detail_widths.load(Ordering::Relaxed), 0);
+        let chunk = (0, 0);
+        let columns = || ReducedColumns::new(Arc::new(std::array::from_fn(|_| Column::default())));
+        // Only tiles in `ready` are read. A level-0 tile has cells one block
+        // wide, which is the chunk's own columns: no reduction, no bit.
+        lod.ready.insert(
+            TileKey {
+                x: 0,
+                z: 0,
+                level: 0,
+            },
+            TileColumns::empty(),
+        );
+        lod.apply_detail(chunk, &columns());
+        assert_eq!(
+            lod.shared.detail_widths.load(Ordering::Relaxed),
+            0,
+            "full-detail cells read the chunk itself"
+        );
+        // A level-2 tile has cells 4 blocks wide: reduction level 1.
+        lod.ready.insert(
+            TileKey {
+                x: 0,
+                z: 0,
+                level: 2,
+            },
+            TileColumns::empty(),
+        );
+        lod.apply_detail(chunk, &columns());
+        assert_eq!(lod.shared.detail_widths.load(Ordering::Relaxed), 0b10);
+    }
+    /// Detail read before a refresh over its chunk is dropped (asked
+    /// again); elsewhere, or read after, it is kept.
+    /// Out and home again: the tiles the trip let go come back, the coarsest
+    /// level first and a level once the meshes are in, without a sample job.
+    #[test]
+    fn a_return_takes_kept_tiles_back_coarse_first_instead_of_sampling() {
+        let mut lod = Lod::scheduler_for_test();
+        let filled = Arc::new(TileColumns::filled(&Column::from_surface(Some(Surface {
+            height: 70,
+            state: BlockStateId(1),
+            water: None,
+            biome: 0,
+        }))));
+        lod.replan([0, 0], 2, 64, 0, None);
+        let home: Vec<_> = lod.plan.nodes.iter().copied().collect();
+        for &key in &home {
+            lod.ready.insert(key, filled.clone());
+        }
+        lod.replan([200_000, 0], 2, 64, 0, None);
+        let left: Vec<_> = home
+            .iter()
+            .copied()
+            .filter(|key| !lod.plan.nodes.contains(key))
+            .collect();
+        assert!(!left.is_empty() && left.iter().all(|key| !lod.ready.contains_key(key)));
+        lod.replan([0, 0], 2, 64, 0, None);
+        // Those at the seam with the near chunks are sampled fresh instead.
+        let (wanted, seam): (Vec<_>, Vec<_>) = left
+            .iter()
+            .copied()
+            .filter(|key| lod.plan.nodes.contains(key))
+            .partition(|key| lod.plan.stands_in(*key));
+        assert!(!wanted.is_empty() && !seam.is_empty());
+        assert!(seam.iter().all(|key| !lod.kept.contains(key)));
+        // Nothing else to sample: they are on their way back.
+        lod.request_samples([0, 0]);
+        assert!(wanted.iter().all(|key| !lod.pending.contains(key)));
+        assert!(seam.iter().any(|key| lod.pending.contains(key)));
+        let coarsest = wanted.iter().map(|key| key.level).max().unwrap();
+        // Meshes outstanding: nothing comes back yet.
+        lod.unmeshed
+            .extend((0..=RETURN_BACKLOG as i32).map(|x| TileKey {
+                x,
+                z: 9_999,
+                level: 0,
+            }));
+        lod.bring_back();
+        assert!(wanted.iter().all(|key| !lod.ready.contains_key(key)));
+        lod.unmeshed.clear();
+        lod.bring_back();
+        for key in &wanted {
+            assert_eq!(
+                lod.ready.contains_key(key),
+                key.level == coarsest,
+                "{key:?}"
+            );
+        }
+        // Finer ones wait for the seam's samples.
+        for _ in 0..64 {
+            lod.bring_back();
+        }
+        assert!(
+            !lod.returning.is_empty()
+                && lod
+                    .returning
+                    .iter()
+                    .all(|key| key.level <= RETURN_FINE_LEVEL)
+        );
+        for key in &seam {
+            lod.ready.insert(*key, filled.clone());
+        }
+        assert!(!lod.seam_open());
+        while !lod.returning.is_empty() {
+            lod.unmeshed.clear();
+            lod.bring_back();
+        }
+        assert!(
+            wanted
+                .iter()
+                .all(|key| lod.ready.get(key).is_some_and(|s| Arc::ptr_eq(s, &filled)))
+        );
+        assert!(lod.pending.iter().all(|key| seam.contains(key)));
+    }
+    #[test]
+    fn only_detail_a_later_refresh_covers_is_dropped() {
+        let mut lod = Lod::scheduler_for_test();
+        let asked = lod.refreshes;
+        lod.refresh([0, 0, 64, 64], (1, 16));
+        assert!(lod.refreshed_since((1, 1), asked));
+        assert!(lod.refreshed_since((4, 0), asked), "a chunk around");
+        assert!(!lod.refreshed_since((40, 40), asked), "elsewhere");
+        assert!(!lod.refreshed_since((1, 1), lod.refreshes), "read after");
+        for _ in 0..MAX_REFRESHED {
+            lod.refresh([10_000, 10_000, 10_064, 10_064], (1, 16));
+        }
+        assert!(lod.refreshed_since((40, 40), asked), "too old to tell");
+    }
+    #[test]
+    fn refreshed_areas_forget_detail_but_seen_chunks() {
+        let key = TileKey {
+            x: 1,
+            z: 0,
+            level: 1,
+        };
+        assert!(key.overlaps([40, 0, 50, 1]) && !key.overlaps([64, 0, 80, 32]));
+        // Only cells of the widths the new data is drawn in, a cell around.
+        assert!(key.refreshed_by([64, 0, 80, 32], (1, 16)));
+        assert!(!key.refreshed_by([65, 0, 80, 32], (1, 16)));
+        assert!(!key.refreshed_by([40, 0, 50, 1], (25, i32::MAX)));
+        let root = TileKey {
+            x: 0,
+            z: 0,
+            level: MAX_LEVEL,
+        };
+        assert!(!root.refreshed_by([40, 0, 72, 32], (1, 16)));
+        assert!(root.refreshed_by([0, 0, 800, 800], (25, i32::MAX)));
+        // Level 1: 2 × 2 cells a chunk, chunks 2..4 × 0..2.
+        let mut mask = [u64::MAX; 4];
+        forget_detail(key, [48, 0, 64, 16], &mut mask, |_| false);
+        let cleared: Vec<_> = (0..256)
+            .filter(|i| mask[i / 64] & (1 << (i % 64)) == 0)
+            .collect();
+        assert_eq!(cleared.len(), 64);
+        assert!(cleared.contains(&8) && cleared.contains(&(7 * 16 + 15)));
+        let mut mask = [u64::MAX; 4];
+        forget_detail(key, [0, 0, 1024, 1024], &mut mask, |chunk| chunk == (2, 1));
+        assert_eq!(mask.iter().map(|m| m.count_ones()).sum::<u32>(), 64);
+    }
+    #[test]
+    fn tiles_sampled_without_a_kept_chunk_are_sampled_again() {
+        let tile = |level: u8| {
+            let size = 16 << level;
+            TileKey {
+                x: (3 * 16i32).div_euclid(size),
+                z: (-5 * 16i32).div_euclid(size),
+                level,
+            }
+        };
+        let empty = TileColumns::empty;
+        let filled = || {
+            let column = Column {
+                surface: None,
+                spans: vec![Span {
+                    min: -64,
+                    max: 70,
+                    state: BlockStateId(1),
+                    biome: 0,
+                    light: 0,
+                }]
+                .into(),
+            };
+            Arc::new(TileColumns::filled(&column))
+        };
+        let mut ready = FxHashMap::default();
+        let mut pending = FxHashSet::default();
+        // Cells of a chunk or less take its detail; wider ones sampled empty
+        // there are sampled again, and filled ones aren't.
+        ready.insert(tile(2), empty());
+        ready.insert(tile(5), empty());
+        ready.insert(tile(6), filled());
+        assert_eq!(resampled_over(&ready, &pending, (3, -5)), [tile(5)]);
+        // Samples in flight may predate it: those that detail can't patch.
+        pending.extend([tile(1), tile(2), tile(6), tile(7)]);
+        assert_eq!(
+            resampled_over(&ready, &pending, (3, -5)),
+            [tile(1), tile(5), tile(6), tile(7)]
+        );
+        assert!(resampled_over(&ready, &FxHashSet::default(), (40, 40)).is_empty());
+    }
+    #[test]
+    #[ignore = "daily"]
+    fn slab_materials_survive_chunk_summaries_and_draw_far_faces() -> crate::Result<()> {
+        use crate::{assets::Assets, biome::Biomes, light::LightTables, mesher::MeshTables};
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("HORIZON_TEST_RESOURCES"),
+        );
+        let assets = Arc::new(Assets::load(&root)?);
+        let resource_root = crate::resource_source::ResourceRoot::directory(root.clone());
+        let render = Arc::new(assets.reload(&resource_root)?);
+        let facts = BlockFacts::load(&root, assets.registry)?;
+        let context = WorkerContext {
+            light: Arc::new(LightTables::load(&root, assets.registry, &facts)?),
+            tables: Arc::new(MeshTables::new(
+                &assets,
+                &render,
+                &facts,
+                crate::models::load_visibility(&root, assets.registry)?,
+                None,
+            )?),
+            assets: assets.clone(),
+            render,
+            biomes: Arc::new(Biomes::load(&resource_root)?),
+            hidden_states: Arc::from([]),
+            part_tables: Default::default(),
+        };
+        let kinds = state_kinds(&facts);
+        let mut chunk = Chunk::empty(0, 0);
+        let mut mesher = mesh::Mesher::default();
+        let mut materials = FxHashSet::default();
+        // Real top, bottom, double and waterlogged states: a waterlogged slab
+        // must keep its material rather than become a column of plain water.
+        for (i, f) in facts.states.iter().enumerate() {
+            if !f.name.ends_with("_slab") {
+                continue;
+            }
+            materials.insert(f.name.as_ref());
+            let state = BlockStateId(i as u32);
+            chunk.set(3, 90, 3, state.0);
+            let columns = summarize(&chunk, &kinds);
+            let column = &columns[3 * 16 + 3];
+            assert_eq!(column.spans.len(), 1, "{} state {i}", f.name);
+            assert_eq!(column.spans[0].state, state, "{} state {i}", f.name);
+            assert_eq!((column.spans[0].min, column.spans[0].max), (90, 91));
+            assert_eq!(Column::reduced(&columns, 0, 0, 4).spans, column.spans);
+            let mesh = mesher.mesh(
+                TileKey {
+                    x: 0,
+                    z: 0,
+                    level: 0,
+                },
+                &columns
+                    .iter()
+                    .map(|c| c.spans.as_slice())
+                    .collect::<Vec<_>>(),
+                &FxHashSet::default(),
+                None,
+                &context,
+                &std::array::from_fn(|_| Vec::new()),
+                &[],
+            );
+            // Like stairs, far slabs use the existing full-cell approximation.
+            assert_eq!(mesh.solid.len(), 6 * 4, "{} state {i}", f.name);
+            assert!(mesh.translucent.is_empty(), "{} state {i}", f.name);
+        }
+        for name in [
+            "minecraft:smooth_stone_slab",
+            "minecraft:oak_slab",
+            "minecraft:cut_copper_slab",
+        ] {
+            assert!(materials.contains(name), "missing fixture {name}");
+        }
+        Ok(())
+    }
+    /// A far face gives off its block's light level in its vertex, as the section mesher's
+    /// faces do (`MaterialInput.emission`, read from the vertex): the block state's, a fluid's
+    /// own, none for one that gives no light; the same with quad looks or without.
+    #[test]
+    #[ignore = "daily"]
+    fn far_faces_give_off_their_blocks_light_level() -> crate::Result<()> {
+        use crate::{assets::Assets, biome::Biomes, light::LightTables, mesher::MeshTables};
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("HORIZON_TEST_RESOURCES"),
+        );
+        let assets = Arc::new(Assets::load(&root)?);
+        let resource_root = crate::resource_source::ResourceRoot::directory(root.clone());
+        let render = Arc::new(assets.reload(&resource_root)?);
+        let facts = BlockFacts::load(&root, assets.registry)?;
+        let context = WorkerContext {
+            light: Arc::new(LightTables::load(&root, assets.registry, &facts)?),
+            tables: Arc::new(MeshTables::new(
+                &assets,
+                &render,
+                &facts,
+                crate::models::load_visibility(&root, assets.registry)?,
+                None,
+            )?),
+            assets: assets.clone(),
+            render,
+            biomes: Arc::new(Biomes::load(&resource_root)?),
+            hidden_states: Arc::from([]),
+            part_tables: Default::default(),
+        };
+        let kinds = state_kinds(&facts);
+        let registry = assets.registry;
+        let state = |name: &str, properties: &[(&str, &str)]| {
+            let mut state = registry
+                .state(registry.default_state(name).unwrap())
+                .unwrap()
+                .clone();
+            for (key, value) in properties {
+                state.properties.insert((*key).into(), (*value).into());
+            }
+            registry.id(&state).unwrap().0
+        };
+        let blocks: [(&str, &[(&str, &str)], u32); 10] = [
+            ("minecraft:glowstone", &[], 15),
+            ("minecraft:jack_o_lantern", &[], 15),
+            ("minecraft:redstone_lamp", &[("lit", "true")], 15),
+            ("minecraft:redstone_lamp", &[], 0),
+            ("minecraft:crying_obsidian", &[], 10),
+            ("minecraft:magma_block", &[], 3),
+            ("minecraft:shroomlight", &[], 15),
+            ("minecraft:stone", &[], 0),
+            ("minecraft:lava", &[], 15),
+            ("minecraft:water", &[], 0),
+        ];
+        for (name, properties, level) in blocks {
+            let mut chunk = Chunk::empty(0, 0);
+            chunk.set(3, 90, 3, state(name, properties));
+            let columns = summarize(&chunk, &kinds);
+            let meshes = [0, 1].map(|looks| {
+                let mut mesher = mesh::Mesher::default();
+                mesher.looks = looks;
+                mesher.mesh(
+                    TileKey {
+                        x: 0,
+                        z: 0,
+                        level: 0,
+                    },
+                    &columns
+                        .iter()
+                        .map(|c| c.spans.as_slice())
+                        .collect::<Vec<_>>(),
+                    &FxHashSet::default(),
+                    None,
+                    &context,
+                    &std::array::from_fn(|_| Vec::new()),
+                    &[],
+                )
+            });
+            for (looks, mesh) in meshes.iter().enumerate() {
+                let vertices: Vec<&TerrainVertex> =
+                    mesh.solid.iter().chain(&mesh.translucent).collect();
+                assert!(!vertices.is_empty(), "{name} {properties:?}");
+                let levels: FxHashSet<u32> =
+                    vertices.iter().map(|v| 15 - (v.color >> 28)).collect();
+                assert_eq!(
+                    levels,
+                    [level].into_iter().collect(),
+                    "{name} {properties:?}, looks {looks}"
+                );
+            }
+            let bytes = |v: &[TerrainVertex]| bytemuck::cast_slice::<_, u8>(v).to_vec();
+            assert_eq!(bytes(&meshes[0].solid), bytes(&meshes[1].solid), "{name}");
+            assert_eq!(
+                bytes(&meshes[0].translucent),
+                bytes(&meshes[1].translucent),
+                "{name}"
+            );
+            // A `shaders/` pack's far faces have main's alpha from before the level and the fluid
+            // flag: the same faces, the tier in the low nibble and 0xF in the high one, or on a
+            // fluid 8 plus the face (main's `fluid_face`; with looks, for each quad's face).
+            let mut mesher = mesh::Mesher::default();
+            mesher.shader_pack = true;
+            mesher.looks = 1;
+            let old = mesher.mesh(
+                TileKey {
+                    x: 0,
+                    z: 0,
+                    level: 0,
+                },
+                &columns
+                    .iter()
+                    .map(|c| c.spans.as_slice())
+                    .collect::<Vec<_>>(),
+                &FxHashSet::default(),
+                None,
+                &context,
+                &std::array::from_fn(|_| Vec::new()),
+                &[],
+            );
+            let fluid = name.ends_with("lava") || name.ends_with("water");
+            let quads = |m: &crate::mesher::SectionMesh| -> Vec<([TerrainVertex; 4], u32)> {
+                let solid = m.solid.as_chunks::<4>().0.iter().zip(&m.solid_looks);
+                let translucent = m.translucent.as_chunks::<4>().0.iter();
+                solid
+                    .chain(translucent.zip(&m.translucent_looks))
+                    .map(|(q, l)| (*q, l.0[0] >> 27 & 7))
+                    .collect()
+            };
+            let (now, then) = (quads(&meshes[1]), quads(&old));
+            assert_eq!(now.len(), then.len(), "{name}");
+            for ((now, _), (then, face)) in now.into_iter().zip(then) {
+                let want = now.map(|v| TerrainVertex {
+                    color: match fluid {
+                        false => v.color | 0xF800_0000,
+                        true => v.color & 0x07FF_FFFF | (0x8 | face) << 28 | 0x0800_0000,
+                    },
+                    ..v
+                });
+                assert_eq!(
+                    bytes(&want),
+                    bytes(&then),
+                    "{name} {properties:?}, face {face}"
+                );
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "daily"]
+    fn real_mesh_clips_near_chunks_and_preserves_water_and_edited_surfaces() -> crate::Result<()> {
+        use crate::{
+            assets::Assets, biome::Biomes, light::LightTables, mesher::MeshTables,
+            testgen::TestTerrain,
+        };
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("HORIZON_TEST_RESOURCES"),
+        );
+        let assets = Arc::new(Assets::load(&root)?);
+        let render = Arc::new(assets.reload(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        )?);
+        let facts = BlockFacts::load(&root, assets.registry)?;
+        let biomes = Arc::new(Biomes::load(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        )?);
+        let tables = Arc::new(MeshTables::new(
+            &assets,
+            &render,
+            &facts,
+            crate::models::load_visibility(&root, assets.registry)?,
+            None,
+        )?);
+        let context = Arc::new(WorkerContext {
+            light: Arc::new(LightTables::load(&root, assets.registry, &facts)?),
+            tables,
+            assets: assets.clone(),
+            render,
+            biomes: biomes.clone(),
+            hidden_states: Arc::from([]),
+            part_tables: Default::default(),
+        });
+        let source = Arc::new(TestTerrain::new(assets.registry, &biomes)?);
+        let mut lod = Lod::new(source, context);
+        let stone = assets.registry.default_state("minecraft:stone").unwrap();
+        let water = assets.registry.default_state("minecraft:water").unwrap();
+        let key = TileKey {
+            x: -1,
+            z: -1,
+            level: 5,
+        };
+        lod.ready.insert(
+            key,
+            Arc::new(TileColumns::filled(&Column::from_surface(Some(Surface {
+                height: 70,
+                state: stone,
+                water: Some((80, water)),
+                biome: biomes.id("minecraft:plains"),
+            })))),
+        );
+        // A chunk covers only one quarter of this parent's 32² cell. Both
+        // opaque terrain and water must leave precisely that 16² footprint.
+        // Only active tiles enter the mesher snapshot, even when samples are ready.
+        lod.active.insert(key);
+        Arc::make_mut(&mut lod.covered).insert((-1, -2));
+        lod.covered_bounds = Some([-16, -32, 0, -16]);
+        let mesh = lod.mesh(key);
+        lod.active.remove(&key);
+        let top_area = |vertices: &[TerrainVertex], y: f32| {
+            vertices
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|quad| quad.iter().all(|v| (v.pos[1] - y).abs() < 0.001))
+                .map(|quad| {
+                    let a = glam::Vec3::from(quad[0].pos);
+                    let b = glam::Vec3::from(quad[1].pos);
+                    let c = glam::Vec3::from(quad[2].pos);
+                    let normal = (b - a).cross(c - a);
+                    assert!(normal.y > 0.0, "surface must face the camera from above");
+                    let center = (a + c) * 0.5;
+                    let [ox, _, oz] = key.origin();
+                    let chunk = (
+                        ((center.x as i32) + ox).div_euclid(16),
+                        ((center.z as i32) + oz).div_euclid(16),
+                    );
+                    assert!(
+                        !lod.covered.contains(&chunk),
+                        "LOD overlaps a full-detail chunk"
+                    );
+                    normal.y
+                })
+                .sum::<f32>()
+        };
+        let expected = (key.size() * key.size() - 16 * 16) as f32;
+        assert_eq!(top_area(&mesh.solid, 70.0), expected);
+        assert_eq!(top_area(&mesh.translucent, 80.0 - 1.0 / 9.0), expected);
+        assert!(mesh.translucent.iter().all(|v| v.light == 240));
+        let side = |axis: usize, plane: f32, low: f32, high: f32| {
+            let other = if axis == 0 { 2 } else { 0 };
+            mesh.solid
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|quad| {
+                    quad.iter().all(|v| v.pos[axis] == plane)
+                        && quad.iter().map(|v| v.pos[1]).fold(f32::INFINITY, f32::min)
+                            == MIN_Y as f32
+                        && quad
+                            .iter()
+                            .map(|v| v.pos[1])
+                            .fold(f32::NEG_INFINITY, f32::max)
+                            == 70.0
+                        && quad
+                            .iter()
+                            .map(|v| v.pos[other])
+                            .fold(f32::INFINITY, f32::min)
+                            == low
+                        && quad
+                            .iter()
+                            .map(|v| v.pos[other])
+                            .fold(f32::NEG_INFINITY, f32::max)
+                            == high
+                })
+                .map(move |quad| {
+                    let a = glam::Vec3::from(quad[0].pos);
+                    (glam::Vec3::from(quad[1].pos) - a).cross(glam::Vec3::from(quad[2].pos) - a)
+                        [axis]
+                })
+                .collect::<Vec<_>>()
+        };
+        // The two exposed edges face the missing full-detail chunk and seal
+        // the height mismatch all the way down. Shared subpieces add no walls.
+        let east_cut = side(0, 496.0, 480.0, 496.0);
+        assert_eq!(east_cut.len(), 1);
+        assert!(east_cut[0] > 0.0);
+        let north_cut = side(2, 496.0, 496.0, 512.0);
+        assert_eq!(north_cut.len(), 1);
+        assert!(north_cut[0] < 0.0);
+        assert!(side(0, 496.0, 496.0, 512.0).is_empty());
+
+        // Block edits do not refresh Chunk.heights; observation must scan the
+        // actual blocks, including builds above the old heightmap. The worker
+        // summarizes the chunk; its result is kept on receipt.
+        let receive_observed = |lod: &mut Lod| {
+            let Done::Observed(key, columns) = lod
+                .results
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            else {
+                panic!("expected the observed chunk's summary");
+            };
+            lod.finish_observed(key, columns);
+        };
+        let mut chunk = Chunk::empty(-1, -1);
+        chunk.set(0, 120, 0, stone.0);
+        chunk.set(4, 54, 4, stone.0);
+        for y in 55..64 {
+            chunk.set(4, y, 4, water.0);
+        }
+        // Chorus is thin and non-solid but must survive the visit summary.
+        let end_stone = assets
+            .registry
+            .default_state("minecraft:end_stone")
+            .unwrap();
+        let chorus = assets
+            .registry
+            .default_state("minecraft:chorus_plant")
+            .unwrap();
+        let flower = assets
+            .registry
+            .default_state("minecraft:chorus_flower")
+            .unwrap();
+        chunk.set(8, 70, 8, end_stone.0);
+        chunk.set(8, 71, 8, chorus.0);
+        chunk.set(8, 72, 8, chorus.0);
+        chunk.set(8, 73, 8, flower.0);
+        // Kelp to the surface is water; powder snow and a waterlogged stair
+        // are kept as themselves.
+        let state = |name: &str| assets.registry.default_state(name).unwrap();
+        let (kelp, powder_snow) = (state("minecraft:kelp"), state("minecraft:powder_snow"));
+        let stair = facts
+            .states
+            .iter()
+            .position(|f| &*f.name == "minecraft:oak_stairs" && f.waterlogged)
+            .map(|i| BlockStateId(i as u32))
+            .unwrap();
+        chunk.set(2, 54, 2, stone.0);
+        for y in 55..64 {
+            chunk.set(2, y, 2, kelp.0);
+        }
+        chunk.set(6, 90, 6, stone.0);
+        chunk.set(6, 91, 6, powder_snow.0);
+        chunk.set(10, 54, 10, stone.0);
+        chunk.set(10, 55, 10, stair.0);
+        lod.observe(Arc::new(chunk.clone()), &facts);
+        receive_observed(&mut lod);
+        let observed = &lod.saved[&(-1, -1)];
+        assert_eq!(observed.surface(0).unwrap().height, 121);
+        assert_eq!(observed.surface(0).unwrap().state, stone);
+        assert_eq!(observed.surface(68).unwrap().height, 55);
+        assert_eq!(observed.surface(68).unwrap().water, Some((64, water)));
+        let chorus_idx = 8 * 16 + 8;
+        assert_eq!(observed.surface(chorus_idx).unwrap().state, flower);
+        assert_eq!(
+            observed
+                .spans(chorus_idx)
+                .iter()
+                .map(|span| (span.min, span.max, span.state))
+                .collect::<Vec<_>>(),
+            vec![(70, 71, end_stone), (71, 73, chorus), (73, 74, flower)]
+        );
+        let kelp_idx = 2 * 16 + 2;
+        assert_eq!(observed.surface(kelp_idx).unwrap().height, 55);
+        assert_eq!(observed.surface(kelp_idx).unwrap().water, Some((64, water)));
+        assert_eq!(observed.surface(6 * 16 + 6).unwrap().state, powder_snow);
+        assert_eq!(observed.surface(6 * 16 + 6).unwrap().height, 92);
+        assert_eq!(observed.surface(10 * 16 + 10).unwrap().state, stair);
+
+        let fine = TileKey {
+            x: -1,
+            z: -1,
+            level: 0,
+        };
+        lod.ready.insert(fine, TileColumns::empty());
+        lod.finish_detail((-1, -1), ReducedColumns::from_tile(TileColumns::empty()));
+        assert_eq!(
+            lod.ready[&fine].surface(0).unwrap().height,
+            121,
+            "late seed generation cannot overwrite a visited build"
+        );
+        assert_eq!(lod.detail_masks[&fine], [u64::MAX; 4]);
+        Arc::make_mut(&mut lod.plan.nodes).insert(fine);
+        lod.pending.insert(fine);
+        lod.finish_sample(fine, vec![Column::default(); 256]);
+        assert_eq!(
+            lod.ready[&fine].surface(0).unwrap().height,
+            121,
+            "a late coarse sampling job cannot erase completed detail"
+        );
+        assert_eq!(lod.detail_masks[&fine], [u64::MAX; 4]);
+        Arc::make_mut(&mut lod.plan.nodes).remove(&fine);
+
+        // The worker's summary comes with the reusable pyramid; a newer
+        // observation replaces both, and an unchanged one changes nothing.
+        assert!(Arc::ptr_eq(
+            &lod.reduced[&(-1, -1)].columns,
+            &lod.saved[&(-1, -1)]
+        ));
+        let reduced_spans = |lod: &Lod| {
+            lod.snapshot()
+                .visited_source(-16, -16, 2)
+                .unwrap()
+                .get()
+                .iter()
+                .map(|span| (span.min, span.max, span.state))
+                .collect::<Vec<_>>()
+        };
+        // Reduction keeps a block held by any column of the footprint, so
+        // this single-column build survives the cached two-block reduction.
+        assert_eq!(reduced_spans(&lod), vec![(120, 121, stone)]);
+        let old = lod.saved[&(-1, -1)].clone();
+        lod.observe(Arc::new(chunk.clone()), &facts);
+        receive_observed(&mut lod);
+        assert!(Arc::ptr_eq(&lod.saved[&(-1, -1)], &old));
+        chunk.set(0, 130, 0, stone.0);
+        lod.observe(Arc::new(chunk.clone()), &facts);
+        receive_observed(&mut lod);
+        assert_eq!(lod.ready[&fine].surface(0).unwrap().height, 131);
+        assert!(Arc::ptr_eq(
+            &lod.reduced[&(-1, -1)].columns,
+            &lod.saved[&(-1, -1)]
+        ));
+        assert_eq!(
+            reduced_spans(&lod),
+            vec![(120, 121, stone), (130, 131, stone)]
+        );
+        // A seed reduction arriving after the edit cannot restore old data.
+        lod.finish_detail((-1, -1), ReducedColumns::from_tile(old));
+        assert_eq!(lod.ready[&fine].surface(0).unwrap().height, 131);
+        assert_eq!(
+            reduced_spans(&lod),
+            vec![(120, 121, stone), (130, 131, stone)]
+        );
+
+        // Exercise the actual worker/update seam: a parent stays displayed
+        // until all four child meshes have arrived, possibly over several updates.
+        let camera = [-256.0, 100.0, -256.0];
+        lod.area = Some(([-16, -16], 2, 64, 0, false, None));
+        lod.plan.roots = vec![key];
+        Arc::make_mut(&mut lod.plan.nodes).insert(key);
+        // As a replan does (`update` only selects after a change).
+        lod.reselect = true;
+        let await_meshes = |lod: &mut Lod, count: usize| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut uploaded = Vec::new();
+            loop {
+                uploaded.extend(lod.update(camera, 2, 64, None, None));
+                if uploaded.len() >= count {
+                    return uploaded;
+                }
+                assert!(
+                    lod.removed().is_empty(),
+                    "retired before replacement meshes"
+                );
+                assert!(std::time::Instant::now() < deadline, "mesh worker stalled");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        let uploaded = await_meshes(&mut lod, 1);
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(uploaded[0].0, key);
+        assert!(lod.active.contains(&key));
+        Arc::make_mut(&mut lod.plan.split).insert(key);
+        for child in key.children() {
+            Arc::make_mut(&mut lod.plan.nodes).insert(child);
+            lod.ready.insert(child, lod.ready[&key].clone());
+        }
+        lod.reselect = true;
+        let uploaded = await_meshes(&mut lod, 4);
+        assert_eq!(uploaded.len(), 4);
+        assert!(
+            key.children()
+                .iter()
+                .all(|child| lod.active.contains(child))
+        );
+        assert_eq!(lod.removed(), [key]);
+
+        let covered_fine = TileKey {
+            x: -1,
+            z: -2,
+            level: 0,
+        };
+        lod.plan = Plan::default();
+        lod.plan.roots.push(covered_fine);
+        Arc::make_mut(&mut lod.plan.nodes).insert(covered_fine);
+        lod.ready.insert(covered_fine, TileColumns::empty());
+        Arc::make_mut(&mut lod.covered).insert((-1, -2));
+        lod.reselect = true;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            lod.update(camera, 2, 64, None, None);
+            if lod.outstanding_meshes == 0 && lod.active.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "covered normal chunk remained an active LOD mask"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(lod.progress(), (1, 1));
+
+        // Keep one sample outstanding, as on ordinary frames. Completing just
+        // one job at a time must still let both loading queues make progress.
+        lod.shared.stop.store(true, Ordering::Relaxed);
+        lod.shared.wake.notify_all();
+        lod.thread.take().unwrap().join().unwrap();
+        while lod.results.try_recv().is_ok() {}
+        lod.shared.jobs.lock().unwrap().clear();
+        lod.plan = Plan::new([-256, -256], 2, 64);
+        let parent = TileKey {
+            x: -2,
+            z: -2,
+            level: 3,
+        };
+        lod.plan.roots = vec![parent];
+        lod.ready.clear();
+        lod.ready.insert(parent, TileColumns::empty());
+        lod.active = [parent].into_iter().collect();
+        lod.sync_sample(parent);
+        lod.sample_jobs = SAMPLE_JOBS;
+        lod.pending = (0..SAMPLE_JOBS - 1)
+            .map(|i| TileKey {
+                x: 999 + i as i32,
+                z: 999,
+                level: 0,
+            })
+            .collect();
+        lod.detail_request_pending = true;
+        lod.wanted_stale = true;
+        lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
+        let Some(Job::Sample(nearby)) = lod.shared.jobs.lock().unwrap().pop_front() else {
+            panic!("nearby detail was not scheduled");
+        };
+        assert_eq!(nearby.level, 0);
+        assert_eq!(
+            nearby.distance([-256, -256]),
+            0,
+            "the nearest tiles load first"
+        );
+        lod.finish_sample(nearby, vec![Column::default(); 256]);
+        lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
+        let Some(Job::Sample(next)) = lod.shared.jobs.lock().unwrap().pop_front() else {
+            panic!("the next ring was not scheduled");
+        };
+        assert!(
+            !lod.plan.split.contains(&next) && next.distance([-256, -256]) <= 64,
+            "the next nearest final tile, never a coarse one under it: {next:?}"
+        );
+        lod.shared.jobs.lock().unwrap().clear();
+        let near = TileKey {
+            x: -4,
+            z: -4,
+            level: 2,
+        };
+        let far = TileKey {
+            x: 0,
+            z: 0,
+            level: 6,
+        };
+        lod.plan = Plan::default();
+        lod.plan.roots = vec![near, far];
+        lod.ready.clear();
+        for parent in [near, far] {
+            Arc::make_mut(&mut lod.plan.nodes).insert(parent);
+            Arc::make_mut(&mut lod.plan.split).insert(parent);
+            Arc::make_mut(&mut lod.plan.nodes).extend(parent.children());
+            lod.ready.insert(parent, TileColumns::empty());
+        }
+        lod.active = [near, far].into_iter().collect();
+        lod.wanted_stale = true;
+        lod.shared.jobs.lock().unwrap().clear();
+        lod.sample_jobs = SAMPLE_JOBS;
+        lod.pending = (0..SAMPLE_JOBS - 1)
+            .map(|i| TileKey {
+                x: 999 + i as i32,
+                z: 999,
+                level: 0,
+            })
+            .collect();
+        lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
+        let Some(Job::Sample(first)) = lod.shared.jobs.lock().unwrap().pop_front() else {
+            panic!("no final tile scheduled")
+        };
+        assert_eq!(
+            (first.level, first.parent()),
+            (1, near),
+            "the nearest parent's final tiles come first"
+        );
+        lod.shared.jobs.lock().unwrap().clear();
+        lod.active = (0..DETAIL_REQUEST as i32 + 8)
+            .map(|x| TileKey { x, z: 0, level: 0 })
+            .collect();
+        Arc::make_mut(&mut lod.plan.split).clear();
+        lod.detail_masks.clear();
+        lod.covered = Arc::new([(0, 0)].into_iter().collect());
+        lod.full = (*lod.covered).clone();
+        lod.detail_request_pending = false;
+        lod.detail_request_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        lod.request_detail([0, 0]);
+        let Some(Job::RequestDetail { chunks, .. }) = lod.shared.jobs.lock().unwrap().pop_front()
+        else {
+            panic!("detail batch was not requested");
+        };
+        assert_eq!(
+            chunks,
+            (1..=DETAIL_REQUEST as i32)
+                .map(|x| (x, 0))
+                .collect::<Vec<_>>(),
+            "one unfinished fine tile must not starve neighbouring requests"
+        );
+
+        // The extra sampling threads' slots open once the near terrain is in.
+        lod.small = false;
+        lod.sample_jobs = SAMPLE_JOBS + 3;
+        lod.plan = Plan::new([-256, -256], 2, 64);
+        lod.ready.clear();
+        lod.active.clear();
+        lod.pending.clear();
+        lod.shared.jobs.lock().unwrap().clear();
+        let queued = |lod: &mut Lod, near_loading: bool| {
+            lod.set_near_loading(near_loading);
+            lod.shared.jobs.lock().unwrap().clear();
+            lod.pending.clear();
+            lod.wanted_stale = true;
+            lod.update([-256., 64., -256.], 2, 64, Some(FxHashSet::default()), None);
+            let jobs = lod.shared.jobs.lock().unwrap();
+            jobs.iter()
+                .filter(|job| matches!(job, Job::Sample(_)))
+                .count()
+        };
+        assert_eq!(queued(&mut lod, true), SAMPLE_JOBS);
+        assert_eq!(queued(&mut lod, false), SAMPLE_JOBS + 3);
+        Ok(())
+    }
+
+    #[test]
+    fn far_cells_past_render_distance_12_start_one_block_wide() {
+        // Leaves' cells: 1 block to 256 blocks out, 2 to 512 (Full); Reduced
+        // keeps 1 to the near terrain's edge and 2 to 256.
+        for (reduced, [one, two]) in [(false, [256, 512]), (true, [208, 256])] {
+            let plan = Plan::with_previous([8, 8], 12, 128, &Plan::default(), 0, reduced, None);
+            for key in plan.nodes.iter().filter(|key| !plan.split.contains(key)) {
+                let distance = key.distance([8, 8]);
+                if distance < one {
+                    assert_eq!(key.size() / 16, 1, "{key:?} reduced {reduced}");
+                } else if distance < two {
+                    assert!(key.size() / 16 <= 2, "{key:?} reduced {reduced}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn extra_sampling_threads_only_on_large_machines() {
+        // Small machines are unchanged: a quarter of their cores, never more
+        // than three, so the near chunks and the frame keep theirs.
+        assert_eq!([1, 2, 4].map(sampling_threads), [1, 1, 1]);
+        // From eight, two thirds rather than half, still capped at eight.
+        assert_eq!([8, 11, 12].map(sampling_threads), [5, 7, 8]);
+        assert_eq!([16, 64].map(sampling_threads), [8, 8]);
+        assert_eq!([2, 8, 12, 16].map(meshing_threads), [1, 2, 3, 7]);
+        // From four cores up the two pools together leave one for the frame
+        // and the ticks. Below that both clamp to one and there is nothing
+        // to spare, which is the existing behaviour.
+        for cores in [4usize, 8, 11, 12, 16, 64] {
+            assert!(
+                sampling_threads(cores) + meshing_threads(cores) < cores,
+                "{cores} cores leaves nothing for the frame"
+            );
+        }
+    }
+
+    /// Review point 3 on #4747: a result from a batch that is no longer the
+    /// newest still fills the frame when it is newer than what the tile shows,
+    /// and the tile keeps waiting for the job that is still pending. Accepting
+    /// only the newest revision threw every older result away — and re-marking
+    /// a tile happens again before its mesh arrives on a busy frontier, so no
+    /// result was ever accepted and the tile's removal stayed blocked.
+    #[test]
+    fn a_result_newer_than_the_shown_one_is_kept_while_a_newer_one_is_pending() {
+        let mut lod = Lod::scheduler_for_test();
+        let key = TileKey {
+            x: 0,
+            z: 0,
+            level: 0,
+        };
+        lod.active.insert(key);
+        // Two marks: the second revision is what the tile is waiting for.
+        lod.mark_mesh(key);
+        let older = *lod.mesh_version.get(&key).unwrap();
+        lod.mark_mesh(key);
+        let newest = *lod.mesh_version.get(&key).unwrap();
+        assert!(newest > older);
+        let mut meshes = Vec::new();
+
+        // The older batch's result arrives while the newer job is pending.
+        lod.accept_mesh(key, older, SectionMesh::default(), false, &mut meshes);
+        assert_eq!(meshes.len(), 1, "an older result newer than shown is used");
+        assert_eq!(lod.shown_version.get(&key), Some(&older));
+        assert!(lod.meshed.contains(&key));
+        // Still waiting: the pending job owns the tile, so it stays unmeshed
+        // and keeps being dispatched.
+        assert!(lod.unmeshed.contains(&key), "the pending job still owns it");
+
+        // A result older than what is shown is not drawn again.
+        lod.accept_mesh(key, older, SectionMesh::default(), false, &mut meshes);
+        assert_eq!(meshes.len(), 1, "the same revision is not redrawn");
+
+        // The newest settles the tile.
+        lod.accept_mesh(key, newest, SectionMesh::default(), false, &mut meshes);
+        assert_eq!(meshes.len(), 2);
+        assert_eq!(lod.shown_version.get(&key), Some(&newest));
+        assert!(
+            !lod.unmeshed.contains(&key),
+            "the newest revision settles it"
+        );
+
+        // A canceled result, and one for a tile that left the view, are dropped
+        // however new they are.
+        lod.mark_mesh(key);
+        let next = *lod.mesh_version.get(&key).unwrap();
+        lod.accept_mesh(key, next, SectionMesh::default(), true, &mut meshes);
+        assert_eq!(meshes.len(), 2, "a canceled result is dropped");
+        lod.active.remove(&key);
+        lod.accept_mesh(key, next + 1, SectionMesh::default(), false, &mut meshes);
+        assert_eq!(meshes.len(), 2, "a tile that left the view is dropped");
+    }
+
+    /// A neighbour inside the plan that is not drawn yet is unknown, not
+    /// empty, and its arrival remeshes the tile that faced it. One past the
+    /// planned range is still empty.
+    #[test]
+    fn a_planned_neighbor_that_is_not_ready_is_unknown_not_empty() {
+        let mut lod = Lod::scheduler_for_test();
+        let a = TileKey {
+            x: 0,
+            z: 0,
+            level: 0,
+        };
+        let b = TileKey {
+            x: 1,
+            z: 0,
+            level: 0,
+        };
+        lod.plan = Plan::default();
+        lod.plan.roots = vec![a, b];
+        Arc::make_mut(&mut lod.plan.nodes).extend([a, b]);
+        lod.finish_sample(a, vec![Column::default(); CELLS * CELLS]);
+        assert!(lod.active.contains(&a));
+        let sides = |lod: &Lod| {
+            let input = lod.snapshot().mesh_input(a, Vec::new());
+            [0, 1].map(|side| {
+                input.neighbors[side]
+                    .iter()
+                    .map(|edge| (edge.unknown, matches!(edge.column, ColumnSource::Tile(..))))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let [west, east] = sides(&lod);
+        assert!(west.iter().all(|&edge| edge == (false, false)), "range end");
+        assert!(east.iter().all(|&edge| edge == (true, false)), "planned");
+
+        // Its arrival draws the neighbour and remeshes the tile facing it.
+        lod.dirty.clear();
+        lod.finish_sample(b, vec![Column::default(); CELLS * CELLS]);
+        assert!(lod.dirty.contains_key(&a), "the tile facing it is remeshed");
+        let [_, east] = sides(&lod);
+        assert!(east.iter().all(|&edge| edge == (false, true)), "drawn");
+
+        // Past a split tile's out-of-range child there is nothing to wait for.
+        let parent = TileKey {
+            x: 4,
+            z: 4,
+            level: 1,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).insert(parent);
+        Arc::make_mut(&mut lod.plan.split).insert(parent);
+        Arc::make_mut(&mut lod.plan.nodes).extend(parent.children().into_iter().take(3));
+        let snapshot = lod.snapshot();
+        let [x, _, z] = parent.origin();
+        assert!(snapshot.planned_leaf(x + 1, z + 1), "a planned leaf");
+        assert!(!snapshot.planned_leaf(x + 17, z + 17), "no child planned");
+        assert!(!snapshot.planned_leaf(x - 40, z), "outside the plan");
+    }
+
+    #[test]
+    fn a_planned_neighbor_leaving_the_range_unready_remeshes_the_tile_that_waited() {
+        let mut lod = Lod::scheduler_for_test();
+        let a = TileKey {
+            x: 0,
+            z: 0,
+            level: 0,
+        };
+        let b = TileKey {
+            x: 1,
+            z: 0,
+            level: 0,
+        };
+        lod.plan = Plan::default();
+        lod.plan.roots = vec![a, b];
+        Arc::make_mut(&mut lod.plan.nodes).extend([a, b]);
+        lod.finish_sample(a, vec![Column::default(); CELLS * CELLS]);
+        lod.dirty.clear();
+        // A range of one chunk around (-10, 0) keeps `a` and drops `b`.
+        lod.replan([-10, 0], 0, 1, 0, None);
+        assert!(lod.plan.nodes.contains(&a) && !lod.plan.nodes.contains(&b));
+        assert!(lod.dirty.contains_key(&a), "its east wall is drawn now");
+    }
+
+    #[test]
+    fn observed_fine_columns_replace_active_mesh_samples() {
+        let mut lod = Lod::scheduler_for_test();
+        let key = TileKey {
+            x: 0,
+            z: 0,
+            level: 0,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).insert(key);
+        lod.finish_sample(key, samples(70));
+        let previous = lod.mesh_samples.clone();
+
+        let observed = Arc::new(TileColumns::from_columns(&samples(80)));
+        lod.apply_fine((0, 0), &observed);
+
+        assert_eq!(previous.get(&key).unwrap().spans(0)[0].max, 70);
+        assert_eq!(lod.mesh_samples.get(&key).unwrap().spans(0)[0].max, 80);
+    }
+
+    /// A world entry's first near load lasts until the near terrain has
+    /// stayed in for `FIRST_LOAD_SETTLE`; later loads don't count, nor a load
+    /// that starts long after far terrain was made.
+    #[test]
+    fn the_first_near_load_lasts_until_it_settles() {
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        let steps = |states: &[(bool, u64)]| {
+            states
+                .iter()
+                .fold(FirstLoad::Waiting(t0), |state, &(loading, ms)| {
+                    state.step(loading, at(ms))
+                })
+        };
+        assert!(!steps(&[(false, 500)]).holding());
+        assert!(steps(&[(false, 500), (true, 1000)]).holding());
+        // A gap shorter than the settle time keeps holding, and starts over.
+        assert!(
+            steps(&[
+                (true, 0),
+                (false, 100),
+                (false, 900),
+                (true, 1000),
+                (false, 1100),
+                (false, 2000)
+            ])
+            .holding()
+        );
+        assert_eq!(
+            steps(&[(true, 0), (false, 100), (false, 1100)]),
+            FirstLoad::Over
+        );
+        // Over for good: the next load (the player walking on) holds nothing.
+        assert_eq!(
+            steps(&[(true, 0), (false, 100), (false, 1100), (true, 1200)]),
+            FirstLoad::Over
+        );
+        // Made with the near terrain in: no first load to wait for.
+        assert_eq!(steps(&[(false, 2000), (true, 2100)]), FirstLoad::Over);
+        // A load that never settles stops holding at `FIRST_LOAD_MAX`.
+        let max = FIRST_LOAD_MAX.as_millis() as u64;
+        assert!(steps(&[(true, 0), (true, max - 1)]).holding());
+        assert_eq!(steps(&[(true, 0), (true, max)]), FirstLoad::Over);
+    }
+    /// The two-second start deadline must expire before `Waiting -> Loading`,
+    /// regardless of which frame crosses `FIRST_LOAD_START`.
+    #[test]
+    fn waiting_deadline_expires_before_activating_on_late_loading() {
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        let run = |states: &[(bool, u64)]| {
+            states
+                .iter()
+                .fold(FirstLoad::Waiting(t0), |state, &(loading, ms)| {
+                    state.step(loading, at(ms))
+                })
+        };
+        assert_eq!(run(&[(false, 1900), (true, 2100)]), FirstLoad::Over);
+        assert_eq!(run(&[(false, 1900), (true, 2000)]), FirstLoad::Over);
+        assert!(run(&[(false, 1900), (true, 1999)]).holding());
+    }
+    /// A rebuilt or newly-toggled `Lod` starts unarmed so near-section rebuilds
+    /// (e.g. shader pack changes) do not trigger a first-load hold; only
+    /// explicit world-entry arming activates it.
+    #[test]
+    fn unarmed_lod_does_not_hold_on_rebuild_until_armed() {
+        let mut lod = Lod::scheduler_for_test();
+        let keys = [0, 1].map(|x| TileKey { x, z: 0, level: 0 });
+        lod.small = false;
+        for key in keys {
+            lod.active.insert(key);
+            lod.ready.insert(key, TileColumns::empty());
+            lod.sync_sample(key);
+            lod.mark_mesh(key);
+        }
+        // Unarmed rebuild (shader pack change / LOD toggle): near loading does
+        // not limit far terrain, so all dirty tiles dispatch at once.
+        lod.set_near_loading(true);
+        assert!(!lod.limited());
+        lod.dispatch_meshes([0, 0]);
+        assert_eq!(lod.shared.mesh_jobs.lock().unwrap().len(), 2);
+
+        // Armed on world entry: near loading activates the one-at-a-time hold.
+        lod.shared.mesh_jobs.lock().unwrap().clear();
+        lod.outstanding_meshes = 0;
+        for key in keys {
+            lod.mark_mesh(key);
+        }
+        lod.arm_first_load();
+        lod.set_near_loading(true);
+        assert!(lod.limited());
+        lod.dispatch_meshes([0, 0]);
+        assert_eq!(lod.shared.mesh_jobs.lock().unwrap().len(), 1);
+    }
+    /// Through the first load a larger machine meshes one far tile at a
+    /// time, the nearest first whatever its level, and none while a sample
+    /// is in flight; once the load is over, every dirty tile goes at once.
+    #[test]
+    fn the_first_load_meshes_one_far_tile_at_a_time_nearest_first() {
+        let mut lod = Lod::scheduler_for_test();
+        let fine = |x| TileKey { x, z: 0, level: 0 };
+        // 64 blocks away, 144 away, and a coarse tile 256 away that the
+        // screen-space priority (`MeshQueued::priority`) would put first.
+        let (near, far) = (fine(4), fine(9));
+        let coarse = TileKey {
+            x: 2,
+            z: 0,
+            level: 3,
+        };
+        for key in [near, far, coarse] {
+            lod.active.insert(key);
+            lod.ready.insert(key, TileColumns::empty());
+            lod.sync_sample(key);
+            lod.mark_mesh(key);
+        }
+        lod.small = false;
+        lod.first_load = FirstLoad::Waiting(std::time::Instant::now());
+        lod.set_near_loading(true);
+        assert!(lod.limited() && !lod.held());
+        let take = |lod: &mut Lod| -> Vec<TileKey> {
+            let mut jobs = lod.shared.mesh_jobs.lock().unwrap();
+            let keys = jobs.drain().map(|queued| queued.job.key).collect();
+            drop(jobs);
+            lod.outstanding_meshes = 0;
+            keys
+        };
+        lod.dispatch_meshes([0, 0]);
+        lod.dispatch_meshes([0, 0]);
+        assert_eq!(take(&mut lod), [near], "one at a time, the nearest");
+        lod.pending.insert(fine(30));
+        lod.dispatch_meshes([0, 0]);
+        assert!(take(&mut lod).is_empty(), "a sample is in flight");
+        lod.pending.clear();
+        lod.dispatch_meshes([0, 0]);
+        assert_eq!(take(&mut lod), [far]);
+
+        // Over: the rest at once.
+        lod.first_load = FirstLoad::Over;
+        lod.set_near_loading(true);
+        lod.dispatch_meshes([0, 0]);
+        assert_eq!(take(&mut lod), [coarse]);
+    }
+
+    /// Small machines hold far meshing while the near terrain loads, and
+    /// only then, first load or not.
+    #[test]
+    fn far_meshing_holds_while_small_machine_near_terrain_loads() {
+        let mut lod = Lod::scheduler_for_test();
+        let keys = [0, 1].map(|x| TileKey { x, z: 0, level: 0 });
+        lod.small = true;
+        lod.first_load = FirstLoad::Waiting(std::time::Instant::now());
+        for key in keys {
+            lod.active.insert(key);
+            lod.ready.insert(key, TileColumns::empty());
+            lod.sync_sample(key);
+            lod.mark_mesh(key);
+        }
+        lod.set_near_loading(true);
+        assert!(lod.held() && !lod.limited());
+        lod.dispatch_meshes([0, 0]);
+        assert!(lod.shared.mesh_jobs.lock().unwrap().is_empty());
+
+        // The first load is still settling, but a small machine isn't limited.
+        lod.set_near_loading(false);
+        assert!(lod.first_load.holding() && !lod.limited());
+        lod.dispatch_meshes([0, 0]);
+        assert_eq!(lod.shared.mesh_jobs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn queued_samples_follow_the_view_and_make_way_for_the_near_terrain() {
+        let mut lod = Lod::scheduler_for_test();
+        lod.small = true;
+        lod.sample_jobs = 16;
+        let queued = |lod: &Lod| -> Vec<TileKey> {
+            let jobs = lod.shared.jobs.lock().unwrap();
+            jobs.iter()
+                .filter_map(|job| match job {
+                    Job::Sample(key) => Some(*key),
+                    _ => None,
+                })
+                .collect()
+        };
+        let observing = |lod: &Lod| {
+            let jobs = lod.shared.jobs.lock().unwrap();
+            jobs.iter().any(|job| matches!(job, Job::Observe((5, 5))))
+        };
+        let pending = |lod: &Lod| -> Vec<TileKey> {
+            let mut keys: Vec<_> = lod.pending.iter().copied().collect();
+            keys.sort();
+            keys
+        };
+        let sorted = |mut keys: Vec<TileKey>| {
+            keys.sort();
+            keys
+        };
+        let none = || Some(FxHashSet::default());
+        lod.update([8., 64., 8.], 2, 64, none(), None);
+        let before = queued(&lod);
+        assert_eq!(before.len(), 16, "a full queue once the near terrain is in");
+        lod.shared
+            .jobs
+            .lock()
+            .unwrap()
+            .push_back(Job::Observe((5, 5)));
+
+        // A chunk's move: the tiles still planned keep their place in line.
+        lod.update([24., 64., 8.], 2, 64, none(), None);
+        let moved = queued(&lod);
+        let kept: Vec<_> = before
+            .iter()
+            .copied()
+            .filter(|key| lod.plan.nodes.contains(key))
+            .collect();
+        assert!(!kept.is_empty());
+        assert_eq!(moved[..kept.len()], kept[..]);
+        assert_eq!(moved.len(), 16);
+        assert!(observing(&lod), "only sample jobs are dropped");
+
+        // A teleport: none of the old view's tiles is sampled any more.
+        lod.update([100_000., 64., 100_000.], 2, 64, none(), None);
+        let after = queued(&lod);
+        assert_eq!(after.len(), 16);
+        assert!(after.iter().all(|key| !moved.contains(key)));
+        assert!(after.iter().all(|key| lod.plan.nodes.contains(key)));
+        assert_eq!(
+            pending(&lod),
+            sorted(after.clone()),
+            "dropped jobs free their slots"
+        );
+
+        // New chunks load nearby: the queue gives way at once, not after it
+        // drained, and the dropped tiles come back, best first, once they are in.
+        lod.set_near_loading(true);
+        assert!(queued(&lod).is_empty());
+        assert!(lod.pending.is_empty());
+        assert!(observing(&lod));
+        lod.set_near_loading(false);
+        lod.update([100_000., 64., 100_000.], 2, 64, none(), None);
+        assert_eq!(queued(&lod), after);
+
+        // Larger machines keep the first `SAMPLE_JOBS` of the queue.
+        lod.small = false;
+        lod.set_near_loading(true);
+        assert_eq!(queued(&lod), after[..SAMPLE_JOBS]);
+        assert_eq!(pending(&lod), sorted(after[..SAMPLE_JOBS].to_vec()));
+    }
+
+    #[test]
+    fn detail_progress_counts_the_columns_that_take_generated_detail() {
+        let mut lod = Lod::scheduler_for_test();
+        let tile = |x, level| TileKey { x, z: 0, level };
+        let (fine, covered, coarse, split) = (tile(0, 0), tile(1, 0), tile(1, 3), tile(1, 2));
+        lod.active = [fine, covered, coarse, split].into_iter().collect();
+        Arc::make_mut(&mut lod.covered).insert((1, 0));
+        Arc::make_mut(&mut lod.plan.split).insert(split);
+        lod.detail_masks.insert(fine, [u64::MAX, 1, 0, 0]);
+        lod.detail_masks.insert(coarse, [u64::MAX; 4]);
+        // Only the fine tile: the covered one is the near chunk's, the split
+        // one stands in for finer tiles and the coarse one is past the detail.
+        assert_eq!(lod.detail_progress(), (256, 65));
+    }
+
+    /// Drives the scheduler by hand: every sample the new incremental path
+    /// produces must select exactly the tiles `Plan::select` selects, after
+    /// every single sample, and across camera moves and distance changes.
+    #[test]
+    fn marking_a_tile_dirties_fallback_ancestors_and_touching_neighbors_only() {
+        let mut lod = Lod::scheduler_for_test();
+        let key = TileKey {
+            x: 0,
+            z: 0,
+            level: 0,
+        };
+        let parent = key.parent();
+        let grand = parent.parent();
+        let west = TileKey {
+            x: -1,
+            z: 0,
+            level: 2,
+        };
+        let near = TileKey {
+            x: -1,
+            z: 0,
+            level: 1,
+        };
+        let far = TileKey {
+            x: -1,
+            z: 1,
+            level: 1,
+        };
+        let near_child = TileKey {
+            x: -1,
+            z: 0,
+            level: 0,
+        };
+        let behind_child = TileKey {
+            x: -2,
+            z: 0,
+            level: 0,
+        };
+        let far_child = TileKey {
+            x: -1,
+            z: 2,
+            level: 0,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).extend([
+            key,
+            parent,
+            grand,
+            west,
+            near,
+            far,
+            near_child,
+            behind_child,
+            far_child,
+        ]);
+        Arc::make_mut(&mut lod.plan.split).extend([parent, grand, west, near, far]);
+        lod.active
+            .extend([key, grand, near_child, behind_child, far_child]);
+        lod.mark_selection_changed(key);
+        let dirty: FxHashSet<_> = lod.dirty.keys().copied().collect();
+        assert!(dirty.contains(&key), "the tile itself");
+        assert!(dirty.contains(&grand), "the active fallback ancestor");
+        assert!(dirty.contains(&near_child), "the neighbor across the side");
+        assert!(
+            !dirty.contains(&far_child),
+            "a neighbor child beyond the changed interval"
+        );
+        assert!(
+            !dirty.contains(&behind_child),
+            "a neighbor child behind the shared face"
+        );
+        assert!(!dirty.contains(&near) && !dirty.contains(&west));
+        // New column data does not move footprints: no fallback ancestor.
+        lod.dirty.clear();
+        lod.mark_data_changed(key);
+        let dirty: FxHashSet<_> = lod.dirty.keys().copied().collect();
+        assert!(dirty.contains(&key));
+        assert!(dirty.contains(&near_child), "edge columns still change");
+        assert!(
+            !dirty.contains(&grand),
+            "a fallback ancestor's clipping did not"
+        );
+    }
+
+    #[test]
+    fn only_children_on_the_shared_face_are_walked() {
+        let west = TileKey {
+            x: -1,
+            z: 0,
+            level: 1,
+        };
+        assert!(Lod::side_flush(
+            TileKey {
+                x: -1,
+                z: 0,
+                level: 0
+            },
+            0,
+            west
+        ));
+        assert!(!Lod::side_flush(
+            TileKey {
+                x: -2,
+                z: 0,
+                level: 0
+            },
+            0,
+            west
+        ));
+        let east = TileKey {
+            x: 1,
+            z: 0,
+            level: 1,
+        };
+        assert!(Lod::side_flush(
+            TileKey {
+                x: 2,
+                z: 0,
+                level: 0
+            },
+            1,
+            east
+        ));
+        assert!(!Lod::side_flush(
+            TileKey {
+                x: 3,
+                z: 0,
+                level: 0
+            },
+            1,
+            east
+        ));
+        let north = TileKey {
+            x: 0,
+            z: -1,
+            level: 1,
+        };
+        assert!(Lod::side_flush(
+            TileKey {
+                x: 0,
+                z: -1,
+                level: 0
+            },
+            2,
+            north
+        ));
+        assert!(!Lod::side_flush(
+            TileKey {
+                x: 0,
+                z: -2,
+                level: 0
+            },
+            2,
+            north
+        ));
+        let south = TileKey {
+            x: 0,
+            z: 1,
+            level: 1,
+        };
+        assert!(Lod::side_flush(
+            TileKey {
+                x: 0,
+                z: 2,
+                level: 0
+            },
+            3,
+            south
+        ));
+        assert!(!Lod::side_flush(
+            TileKey {
+                x: 0,
+                z: 3,
+                level: 0
+            },
+            3,
+            south
+        ));
+    }
+
+    #[test]
+    fn a_cutout_wait_follows_a_retired_tile_to_its_children() {
+        let mut lod = Lod::scheduler_for_test();
+        let parent = TileKey {
+            x: 0,
+            z: 0,
+            level: 1,
+        };
+        let child = parent.children()[0];
+        Arc::make_mut(&mut lod.plan.nodes).insert(parent);
+        Arc::make_mut(&mut lod.plan.split).insert(parent);
+        Arc::make_mut(&mut lod.plan.nodes).insert(child);
+        lod.active.insert(child);
+        lod.unmeshed.insert(child);
+        lod.cutout_pending = Some(Arc::new([(0, 0)].into_iter().collect()));
+        lod.cutout_waiting.insert(parent);
+        lod.transfer_cutout_wait(parent);
+        assert!(!lod.cutout_waiting.contains(&parent));
+        assert!(lod.cutout_waiting.contains(&child));
+        lod.publish_cutout_if_ready();
+        assert!(lod.take_cutout().is_none());
+        lod.cutout_waiting.remove(&child);
+        lod.publish_cutout_if_ready();
+        assert!(lod.take_cutout().is_some());
+        // A level-0 waiter has no children to hand the wait to.
+        let fine = TileKey {
+            x: 5,
+            z: 5,
+            level: 0,
+        };
+        lod.cutout_pending = Some(Arc::new([(5, 5)].into_iter().collect()));
+        lod.cutout_waiting.insert(fine);
+        lod.transfer_cutout_wait(fine);
+        assert!(!lod.cutout_waiting.contains(&fine));
+        lod.publish_cutout_if_ready();
+        assert!(lod.take_cutout().is_some());
+    }
+
+    #[test]
+    fn a_cutout_waits_for_the_tiles_it_affected() {
+        let mut lod = Lod::scheduler_for_test();
+        let tile = TileKey {
+            x: 0,
+            z: 0,
+            level: 0,
+        };
+        lod.cutout_pending = Some(Arc::new([(1, 2)].into_iter().collect()));
+        lod.cutout_waiting.insert(tile);
+        lod.publish_cutout_if_ready();
+        assert!(lod.take_cutout().is_none(), "cutout before its replacement");
+        // A later, unrelated mesh does not stand in for the affected tile.
+        lod.meshed.insert(TileKey {
+            x: 8,
+            z: 8,
+            level: 0,
+        });
+        lod.publish_cutout_if_ready();
+        assert!(lod.take_cutout().is_none());
+        lod.cutout_waiting.remove(&tile);
+        lod.publish_cutout_if_ready();
+        assert_eq!(lod.take_cutout(), Some([(1, 2)].into_iter().collect()));
+        // A second change unions tiles still waiting from the first.
+        lod.cutout_pending = Some(Arc::new([(3, 4)].into_iter().collect()));
+        lod.cutout_waiting.insert(tile);
+        lod.cutout_waiting.remove(&tile);
+        lod.publish_cutout_if_ready();
+        assert_eq!(lod.take_cutout(), Some([(3, 4)].into_iter().collect()));
+    }
+
+    /// A saved summary is not detail: a covered empty stand-in must not let
+    /// the cutout release the full-detail columns under it.
+    #[test]
+    fn a_saved_summary_does_not_release_an_unfilled_stand_in() {
+        let mut lod = Lod::scheduler_for_test();
+        let key = TileKey {
+            x: 3,
+            z: -2,
+            level: 0,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).insert(key);
+        lod.ready.insert(key, TileColumns::empty());
+        lod.saved.insert((3, -2), TileColumns::empty());
+        lod.retiring.insert((3, -2));
+        Arc::make_mut(&mut lod.covered).insert((3, -2));
+        lod.prune_retiring();
+        assert!(lod.retiring.contains(&(3, -2)), "released without detail");
+        assert!(lod.covered.contains(&(3, -2)));
+        lod.detail_masks.insert(key, [u64::MAX; 4]);
+        lod.prune_retiring();
+        assert!(!lod.retiring.contains(&(3, -2)));
+        assert!(!lod.covered.contains(&(3, -2)));
+    }
+
+    /// Completing a subtree must not remesh every tile inside it: only a
+    /// tile's own active transition changes the meshes below it.
+    #[test]
+    fn completing_an_undrawn_subtree_marks_no_descendants() {
+        let mut lod = Lod::scheduler_for_test();
+        let parent = TileKey {
+            x: 0,
+            z: 0,
+            level: 1,
+        };
+        let children = parent.children();
+        Arc::make_mut(&mut lod.plan.nodes).insert(parent);
+        Arc::make_mut(&mut lod.plan.split).insert(parent);
+        lod.active.extend(children);
+        for child in children {
+            Arc::make_mut(&mut lod.plan.nodes).insert(child);
+            lod.ready.insert(child, TileColumns::empty());
+            lod.complete.insert(child, true);
+        }
+        lod.complete.insert(parent, false);
+        lod.dirty.clear();
+        lod.refresh_path(parent);
+        assert!(lod.dirty.is_empty(), "completion remeshed descendants");
+        assert!(lod.complete[&parent]);
+        assert!(!lod.active.contains(&parent));
+    }
+
+    #[test]
+    fn removals_wait_for_every_overlapping_replacement_mesh() {
+        let mut lod = Lod::scheduler_for_test();
+        let parent = TileKey {
+            x: 0,
+            z: 0,
+            level: 1,
+        };
+        let child = TileKey {
+            x: 0,
+            z: 0,
+            level: 0,
+        };
+        lod.active.insert(child);
+        lod.unmeshed.insert(child);
+        lod.removed_pending.insert(parent);
+        lod.release_removed();
+        assert!(
+            lod.removed().is_empty(),
+            "removed before the replacement was meshed"
+        );
+        lod.meshed.insert(child);
+        lod.unmeshed.remove(&child);
+        lod.release_removed();
+        assert_eq!(lod.removed(), [parent]);
+        // Out of range: nothing overlaps it, so it may fade out at once.
+        let gone = TileKey {
+            x: 100,
+            z: 100,
+            level: 3,
+        };
+        lod.removed_pending.insert(gone);
+        lod.release_removed();
+        assert_eq!(lod.removed(), [gone]);
+    }
+
+    #[test]
+    fn incremental_selection_matches_plan_select_after_every_sample() {
+        let mut lod = Lod::scheduler_for_test();
+        let column = Column::from_surface(Some(Surface {
+            height: 64,
+            state: BlockStateId(1),
+            water: None,
+            biome: 0,
+        }));
+        let columns = vec![column; CELLS * CELLS];
+        let mut camera = [0.0, 80.0, 0.0];
+        let finish_queued = |lod: &mut Lod| {
+            let mut keys = Vec::new();
+            {
+                let mut jobs = lod.shared.jobs.lock().unwrap();
+                let mut i = 0;
+                while i < jobs.len() {
+                    if matches!(jobs[i], Job::Sample(_)) {
+                        let Some(Job::Sample(key)) = jobs.remove(i) else {
+                            unreachable!()
+                        };
+                        keys.push(key);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            for key in &keys {
+                lod.finish_sample(*key, columns.clone());
+            }
+            !keys.is_empty()
+        };
+        let check = |lod: &Lod| {
+            let mut expected = Vec::new();
+            for &root in &lod.plan.roots {
+                lod.plan.select(root, &lod.ready, &mut expected);
+            }
+            expected.retain(|key| key.level != 0 || !lod.covered.contains(&(key.x, key.z)));
+            let expected: FxHashSet<_> = expected.into_iter().collect();
+            assert_eq!(lod.active, expected);
+        };
+        for _ in 0..2 {
+            for _ in 0..4000 {
+                lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
+                check(&lod);
+                if !finish_queued(&mut lod) {
+                    break;
+                }
+            }
+            let (desired, sampled) = lod.progress();
+            assert_eq!((desired, sampled), (desired, desired), "all leaves sampled");
+            check(&lod);
+            // Move a chunk: retained samples stay selected, new ones join.
+            camera[0] += 16.0;
+            lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
+            check(&lod);
+        }
+        // A covered level-0 stand-in completes its parent but is not drawn.
+        lod.update(camera, 2, 64, Some([(0, 0)].into_iter().collect()), None);
+        check(&lod);
+        assert!(lod.ready.contains_key(&TileKey {
+            x: 0,
+            z: 0,
+            level: 0
+        }));
+        assert!(!lod.active.contains(&TileKey {
+            x: 0,
+            z: 0,
+            level: 0
+        }));
+        // Shrinking the distance retires tiles and reports them once.
+        lod.update(camera, 0, 32, Some(FxHashSet::default()), None);
+        check(&lod);
+        let _ = lod.removed();
+    }
+    /// The prepared resources' far-terrain worker context and block facts.
+    fn test_context() -> crate::Result<(Arc<WorkerContext>, BlockFacts)> {
+        use crate::{assets::Assets, biome::Biomes, light::LightTables, mesher::MeshTables};
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("HORIZON_TEST_RESOURCES"),
+        );
+        let assets = Arc::new(Assets::load(&root)?);
+        let render = Arc::new(assets.reload(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        )?);
+        let facts = BlockFacts::load(&root, assets.registry)?;
+        let biomes = Arc::new(Biomes::load(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        )?);
+        let tables = Arc::new(MeshTables::new(
+            &assets,
+            &render,
+            &facts,
+            crate::models::load_visibility(&root, assets.registry)?,
+            None,
+        )?);
+        let context = Arc::new(WorkerContext {
+            light: Arc::new(LightTables::load(&root, assets.registry, &facts)?),
+            tables,
+            assets,
+            render,
+            biomes,
+            hidden_states: Arc::from([]),
+            part_tables: Default::default(),
+        });
+        Ok((context, facts))
+    }
+    /// A server's far terrain (`server_terrain`) in a scratch folder, and a
+    /// chunk of stone at y 70 to observe.
+    struct ServerLod {
+        lod: Lod,
+        facts: BlockFacts,
+        stone: BlockStateId,
+        dir: std::path::PathBuf,
+    }
+    impl ServerLod {
+        fn new(name: &str) -> crate::Result<Self> {
+            Self::with(name, |dir| {
+                crate::server_terrain::ServerTerrain::new(dir.into())
+            })
+        }
+        fn with(
+            name: &str,
+            source: impl FnOnce(&std::path::Path) -> Arc<dyn LodSource>,
+        ) -> crate::Result<Self> {
+            let (context, facts) = test_context()?;
+            let stone = context
+                .assets
+                .registry
+                .default_state("minecraft:stone")
+                .unwrap();
+            let dir = std::env::temp_dir().join(format!("horizon-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(Self {
+                lod: Lod::new(source(&dir), context),
+                facts,
+                stone,
+                dir,
+            })
+        }
+        fn observe(&mut self, x: i32, z: i32) {
+            let mut chunk = Chunk::empty(x, z);
+            for i in 0..256 {
+                chunk.set(i % 16, 70, i / 16, self.stone.0);
+            }
+            self.lod.observe(Arc::new(chunk), &self.facts);
+        }
+        /// Updates until nothing is left to sample, summarize or mesh (`settle`:
+        /// for a while), or only a few times.
+        fn run(
+            &mut self,
+            camera: [f64; 3],
+            detail: i32,
+            distance: u32,
+            covered: &FxHashSet<(i32, i32)>,
+            settle: bool,
+        ) {
+            let lod = &mut self.lod;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let mut covered = Some(covered.clone());
+            let mut quiet = 0;
+            while quiet < if settle { 50 } else { 3 } {
+                lod.update(camera, detail, distance, covered.take(), None);
+                lod.removed();
+                // Every tile sampled, but those waiting for their data.
+                let unsampled = lod.plan.nodes.iter().any(|key| {
+                    !lod.plan.split.contains(key)
+                        && !lod.ready.contains_key(key)
+                        && !lod.retry.contains_key(key)
+                });
+                let idle = lod.pending.is_empty()
+                    && lod.outstanding_meshes == 0
+                    && lod.dirty.is_empty()
+                    && lod.observing() == 0
+                    && lod
+                        .shared
+                        .jobs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|job| matches!(job, Job::RequestDetail { .. }))
+                    && !unsampled;
+                quiet = if idle { quiet + 1 } else { 0 };
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "far terrain never settled: {} pending, {} meshing, {} observing, {} jobs, {} unsampled, {} waiting",
+                    lod.pending.len(),
+                    lod.outstanding_meshes,
+                    lod.observing(),
+                    lod.shared.jobs.lock().unwrap().len(),
+                    lod.plan
+                        .nodes
+                        .iter()
+                        .filter(|key| !lod.plan.split.contains(key)
+                            && !lod.ready.contains_key(key)
+                            && !lod.retry.contains_key(key))
+                        .count(),
+                    lod.retry.len(),
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        /// The chunks of `chunks` the active tiles don't draw as observed:
+        /// the visited column or the tile's sample there, at the chunk's middle.
+        fn missing(&self, chunks: impl Iterator<Item = (i32, i32)>) -> Vec<(i32, i32)> {
+            chunks
+                .filter(|&chunk| {
+                    self.drawn(chunk)
+                        .is_none_or(|spans| spans.last().is_none_or(|s| s.max != 71))
+                })
+                .collect()
+        }
+        /// The spans the active tiles draw at a chunk's middle.
+        fn drawn(&self, (cx, cz): (i32, i32)) -> Option<Vec<Span>> {
+            let lod = &self.lod;
+            let snapshot = lod.snapshot();
+            let drawn = |x: i32, z: i32| {
+                let key = lod.active.iter().copied().find(|key| {
+                    let [ox, _, oz] = key.origin();
+                    (ox..ox + key.size()).contains(&x) && (oz..oz + key.size()).contains(&z)
+                })?;
+                let stride = key.size() / CELLS as i32;
+                let [ox, _, oz] = key.origin();
+                let (cx, cz) = ((x - ox) / stride, (z - oz) / stride);
+                let (wx, wz) = (ox + cx * stride, oz + cz * stride);
+                Some(match snapshot.visited_source(wx, wz, stride) {
+                    Some(source) => source.get().to_vec(),
+                    None => lod.ready[&key]
+                        .spans((cz * CELLS as i32 + cx) as usize)
+                        .to_vec(),
+                })
+            };
+            drawn(cx * 16 + 8, cz * 16 + 8)
+        }
+    }
+    impl Drop for ServerLod {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    #[test]
+    #[ignore = "daily"]
+    fn chunks_a_server_dropped_stay_drawn_as_far_terrain() -> crate::Result<()> {
+        let mut far = ServerLod::new("lod-dropped")?;
+        // A server's view distance of 10 (it sends a ring more), drawn to a
+        // render distance of 32 (`streaming.radius`, the covered area).
+        let (view, detail, distance) = (10, 32, 64);
+        let mut resident = FxHashSet::default();
+        let mut dropped = FxHashSet::default();
+        // The player flies east past some 1800 chunks: more than `MAX_SAVED`.
+        let end = 60;
+        for step in 0..=end {
+            let center = (step, 0);
+            let now: FxHashSet<_> = (-view..=view)
+                .flat_map(|dz| (-view..=view).map(move |dx| (center.0 + dx, center.1 + dz)))
+                .collect();
+            for &(x, z) in now.difference(&resident) {
+                far.observe(x, z);
+            }
+            for &(x, z) in resident.difference(&now) {
+                // `forget_remote_chunk`: the last of it, for far terrain.
+                far.observe(x, z);
+                dropped.insert((x, z));
+            }
+            resident = now;
+            let covered = resident
+                .iter()
+                .copied()
+                .filter(|&(x, z)| crate::streaming::in_view_distance(center, detail, x, z))
+                .collect();
+            let camera = [f64::from(center.0 * 16 + 8), 100.0, 8.0];
+            far.run(camera, detail, distance, &covered, step == end);
+        }
+        // Those within the LOD distance of where the player is now.
+        let near = |&(x, z): &(i32, i32)| (x - end).pow(2) + z * z < (distance as i32 - 4).pow(2);
+        let missing = far.missing(dropped.iter().copied().filter(near));
+        assert!(
+            missing.is_empty(),
+            "{} dropped chunks aren't drawn, as {:?}",
+            missing.len(),
+            &missing[..missing.len().min(8)]
+        );
+        Ok(())
+    }
+    #[test]
+    #[ignore = "daily"]
+    fn far_cells_sampled_before_their_chunks_were_kept_fill_in() -> crate::Result<()> {
+        let mut far = ServerLod::new("lod-late")?;
+        // Seen from 5000 blocks: cells of 32 blocks and wider over them.
+        let camera = [-5000.0, 100.0, 8.0];
+        let (detail, distance) = (10, 512);
+        let none = FxHashSet::default();
+        // Every tile sampled while nothing is kept, then 32 × 32 chunks are.
+        far.run(camera, detail, distance, &none, true);
+        let chunks: Vec<_> = (0..32).flat_map(|z| (0..32).map(move |x| (x, z))).collect();
+        assert_eq!(far.missing(chunks.iter().copied()).len(), chunks.len());
+        for &(x, z) in &chunks {
+            far.observe(x, z);
+        }
+        far.run(camera, detail, distance, &none, true);
+        let missing = far.missing(chunks.iter().copied());
+        assert!(
+            missing.is_empty(),
+            "{} kept chunks aren't drawn",
+            missing.len()
+        );
+        Ok(())
+    }
+    /// The sample jobs `request_samples` queues now, taken off the queue.
+    fn queued(lod: &mut Lod) -> Vec<TileKey> {
+        lod.request_samples([0, 0]);
+        let mut jobs = lod.shared.jobs.lock().unwrap();
+        jobs.drain(..)
+            .filter_map(|job| match job {
+                Job::Sample(key) => Some(key),
+                _ => None,
+            })
+            .collect()
+    }
+    fn samples(top: i16) -> Vec<Column> {
+        let mut column = Column::default();
+        column.spans.push(Span {
+            min: -64,
+            max: top,
+            state: BlockStateId(1),
+            biome: 0,
+            light: 0,
+        });
+        vec![column; CELLS * CELLS]
+    }
+    const AREA: [i32; 4] = [0, 0, 128, 128];
+    const ALL: (i32, i32) = (1, i32::MAX);
+
+    /// A tile refreshed while its sample is in flight is sampled once more:
+    /// that sample read the old data. Samples equal to the drawn ones mesh
+    /// nothing.
+    #[test]
+    fn refreshed_tiles_are_sampled_again_and_only_meshed_when_changed() {
+        let mut lod = Lod::scheduler_for_test();
+        let key = TileKey {
+            x: 0,
+            z: 0,
+            level: 3,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).insert(key);
+        lod.active.insert(key);
+        lod.ready
+            .insert(key, Arc::new(TileColumns::from_columns(&samples(70))));
+        assert!(queued(&mut lod).is_empty());
+        lod.refresh(AREA, ALL);
+        assert_eq!(queued(&mut lod), [key]);
+        lod.refresh(AREA, ALL);
+        lod.finish_sample(key, samples(80));
+        assert!(lod.stale.contains(&key), "refreshed again meanwhile");
+        assert!(lod.dirty.contains_key(&key), "new samples are meshed");
+        assert_eq!(queued(&mut lod), [key]);
+        lod.dirty.clear();
+        lod.finish_sample(key, samples(80));
+        assert!(!lod.stale.contains(&key));
+        assert!(lod.dirty.is_empty(), "the same samples mesh nothing");
+        assert!(queued(&mut lod).is_empty());
+        // Data drawn in other cell widths leaves it alone.
+        lod.refresh(AREA, (17, 24));
+        assert!(queued(&mut lod).is_empty());
+    }
+
+    /// With a source that keeps what it observes (a server's chunks), a wide
+    /// tile sampled empty where a chunk is now kept is sampled again.
+    #[test]
+    fn kept_chunks_resample_the_wide_tiles_over_them() {
+        let mut lod = Lod::scheduler_for_test();
+        lod.keeps_observed = true;
+        let key = TileKey {
+            x: 0,
+            z: 0,
+            level: 5,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).insert(key);
+        lod.ready.insert(key, TileColumns::empty());
+        let column = samples(70).swap_remove(0);
+        let columns: Arc<[Column; 256]> = Arc::new(std::array::from_fn(|_| column.clone()));
+        lod.finish_observed((1, 1), ReducedColumns::new(columns));
+        assert!(lod.stale.contains(&key));
+        assert_eq!(queued(&mut lod), [key]);
+    }
+
+    #[test]
+    fn changing_far_detail_samples_tiles_again() {
+        for level in [0, 1, 2, 3, 5] {
+            let mut lod = Lod::scheduler_for_test();
+            let key = TileKey { x: 0, z: 0, level };
+            Arc::make_mut(&mut lod.plan.nodes).insert(key);
+            lod.active.insert(key);
+            lod.ready
+                .insert(key, Arc::new(TileColumns::from_columns(&samples(70))));
+            assert!(
+                queued(&mut lod).is_empty(),
+                "level {level}: sampled tile is not asked again"
+            );
+            lod.set_reduced_detail(true);
+            assert!(
+                lod.ready.contains_key(&key),
+                "level {level}: old samples stay"
+            );
+            assert_eq!(queued(&mut lod), [key], "level {level}: not sampled again");
+            lod.finish_sample(key, samples(70));
+            lod.set_reduced_detail(true);
+            assert!(queued(&mut lod).is_empty(), "level {level}: same value");
+            lod.set_reduced_detail(false);
+            assert_eq!(
+                queued(&mut lod),
+                [key],
+                "level {level}: not sampled again on the way back"
+            );
+        }
+    }
+    #[test]
+    fn tile_columns_preserve_spans_surface_and_shrink_heap_bytes() {
+        let columns: Vec<Column> = (0..CELLS * CELLS)
+            .map(|i| {
+                if i.is_multiple_of(7) {
+                    return Column::default();
+                }
+                let height = 60 + (i % 40) as i32;
+                let surface = Surface {
+                    height,
+                    state: BlockStateId(1 + (i % 5) as u32),
+                    water: i.is_multiple_of(3).then_some((height + 4, BlockStateId(9))),
+                    biome: (i % 17) as u16,
+                };
+                let mut col = Column::from_surface(Some(surface));
+                col.spans.push(Span {
+                    min: height as i16 + 10,
+                    max: height as i16 + 14,
+                    state: BlockStateId(7),
+                    biome: surface.biome,
+                    light: 240,
+                });
+                col
+            })
+            .collect();
+        let tile = TileColumns::from_columns(&columns);
+        assert_eq!(tile.len(), CELLS * CELLS);
+        for (i, col) in columns.iter().enumerate() {
+            assert_eq!(tile.spans(i), col.spans.as_slice(), "spans at {i}");
+            assert_eq!(tile.surface(i), col.surface, "surface at {i}");
+            assert_eq!(
+                tile.is_empty_column(i),
+                *col == Column::default(),
+                "empty at {i}"
+            );
+        }
+        assert!(
+            tile.heap_bytes() < std::mem::size_of_val(columns.as_slice()) / 2,
+            "compact tile ({} B) should be less than half of Vec<Column> ({} B)",
+            tile.heap_bytes(),
+            std::mem::size_of_val(columns.as_slice())
+        );
+
+        // Mixed fluid states (water + lava) in one tile stay lossless.
+        let mut mixed = vec![Column::default(); CELLS * CELLS];
+        let water_col = Surface {
+            height: 60,
+            state: BlockStateId(1),
+            water: Some((64, BlockStateId(9))),
+            biome: 2,
+        };
+        let lava_col = Surface {
+            height: 30,
+            state: BlockStateId(2),
+            water: Some((35, BlockStateId(11))),
+            biome: 8,
+        };
+        mixed[1] = Column::from_surface(Some(water_col));
+        mixed[2] = Column::from_surface(Some(lava_col));
+        let mixed_tile = TileColumns::from_columns(&mixed);
+        assert_eq!(mixed_tile.surface(0), None);
+        assert_eq!(mixed_tile.surface(1), Some(water_col));
+        assert_eq!(mixed_tile.surface(2), Some(lava_col));
+
+        // Heights outside i16 fall back to i32 surface storage losslessly.
+        let mut extreme = vec![Column::default(); CELLS * CELLS];
+        let tall = Surface {
+            height: 100_000,
+            state: BlockStateId(42),
+            water: Some((100_005, BlockStateId(9))),
+            biome: 12,
+        };
+        extreme[5] = Column::from_surface(Some(tall));
+        let extreme_tile = TileColumns::from_columns(&extreme);
+        assert_eq!(extreme_tile.surface(5), Some(tall));
+        assert_eq!(extreme_tile.surface(0), None);
+    }
+
+    /// Reconverting the same raw observed chunk `Arc` (as `ServerTerrain` does
+    /// when a coarse tile becomes ready later) still updates the coarse tile's
+    /// detail bits, while a stale differing response is still rejected.
+    #[test]
+    fn finish_detail_recognizes_reconverted_raw_arc_and_rejects_stale() {
+        let mut lod = Lod::scheduler_for_test();
+        let chunk = (0, 0);
+        let raw_v1: Arc<[Column; 256]> = Arc::new(std::array::from_fn(|_| {
+            Column::from_surface(Some(Surface {
+                height: 70,
+                state: BlockStateId(1),
+                water: None,
+                biome: 0,
+            }))
+        }));
+        // Observe the chunk before the level-2 tile is in `ready`.
+        lod.finish_observed(chunk, ReducedColumns::new(Arc::clone(&raw_v1)));
+        let coarse = TileKey {
+            x: 0,
+            z: 0,
+            level: 2,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).insert(coarse);
+        lod.ready.insert(coarse, TileColumns::empty());
+        assert!(!lod.detail_masks.contains_key(&coarse));
+
+        // Same raw Arc converted a second time must still refine the coarse
+        // tile and set its detail bits, sharing the canonical `saved` Arc.
+        lod.finish_detail(chunk, ReducedColumns::new(Arc::clone(&raw_v1)));
+        let mask = lod
+            .detail_masks
+            .get(&coarse)
+            .expect("coarse detail mask should be populated");
+        for z in 0..4usize {
+            for x in 0..4usize {
+                let index = z * 16 + x;
+                assert_ne!(
+                    mask[index / 64] & (1 << (index % 64)),
+                    0,
+                    "coarse cell {index} detail bit should be set"
+                );
+                assert_eq!(
+                    lod.ready[&coarse].spans(index).last().map(|s| s.max),
+                    Some(70)
+                );
+            }
+        }
+        assert!(Arc::ptr_eq(
+            &lod.reduced[&chunk].columns,
+            &lod.saved[&chunk]
+        ));
+
+        // A newer observation supersedes `raw_v1`; delivering stale `raw_v1`
+        // afterwards must not overwrite level 0 or populate a newly-ready
+        // level-3 tile's coarse detail bits.
+        let fine = TileKey {
+            x: 0,
+            z: 0,
+            level: 0,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).insert(fine);
+        lod.ready.insert(fine, TileColumns::empty());
+        let raw_v2: Arc<[Column; 256]> = Arc::new(std::array::from_fn(|_| {
+            Column::from_surface(Some(Surface {
+                height: 90,
+                state: BlockStateId(2),
+                water: None,
+                biome: 0,
+            }))
+        }));
+        lod.finish_observed(chunk, ReducedColumns::new(Arc::clone(&raw_v2)));
+        let wider = TileKey {
+            x: 0,
+            z: 0,
+            level: 3,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).insert(wider);
+        lod.ready.insert(wider, TileColumns::empty());
+
+        lod.finish_detail(chunk, ReducedColumns::new(Arc::clone(&raw_v1)));
+        assert!(
+            !lod.detail_masks.contains_key(&wider),
+            "stale response must not mark newly-ready coarse bits"
+        );
+        assert!(lod.ready[&wider].spans(0).is_empty());
+        assert_eq!(lod.ready[&fine].surface(0).unwrap().height, 90);
+    }
+
+    /// Single-cell detail updates (level 4) patch an unshared tile in place
+    /// without rebuilding all 256 cells, and copy only when a mesh snapshot
+    /// shares the tile.
+    #[test]
+    fn apply_detail_patches_unshared_single_cell_in_place_and_preserves_shared_snapshot() {
+        let mut lod = Lod::scheduler_for_test();
+        let key = TileKey {
+            x: 0,
+            z: 0,
+            level: 4,
+        };
+        let initial_surface = Surface {
+            height: 70,
+            state: BlockStateId(1),
+            water: None,
+            biome: 3,
+        };
+        let initial = Column::from_surface(Some(initial_surface));
+        Arc::make_mut(&mut lod.plan.nodes).insert(key);
+        lod.active.insert(key);
+        lod.ready
+            .insert(key, Arc::new(TileColumns::filled(&initial)));
+        lod.sync_sample(key);
+
+        let chunk = (2, 3);
+        let cell = 3 * 16 + 2;
+        let ptr_before = Arc::as_ptr(&lod.ready[&key]);
+
+        let two_span_col = Column {
+            surface: None,
+            spans: vec![
+                Span {
+                    min: 0,
+                    max: 40,
+                    state: BlockStateId(1),
+                    biome: 0,
+                    light: 240,
+                },
+                Span {
+                    min: 60,
+                    max: 80,
+                    state: BlockStateId(2),
+                    biome: 0,
+                    light: 240,
+                },
+            ]
+            .into(),
+        };
+        let reduced_two =
+            ReducedColumns::new(Arc::new(std::array::from_fn(|_| two_span_col.clone())));
+        let reduced_empty =
+            ReducedColumns::new(Arc::new(std::array::from_fn(|_| Column::default())));
+
+        // Unshared: grow cell from 1 span to 2 spans in place.
+        lod.apply_detail(chunk, &reduced_two);
+        assert_eq!(Arc::as_ptr(&lod.ready[&key]), ptr_before);
+        assert!(
+            lod.mesh_samples
+                .get(&key)
+                .is_some_and(|s| Arc::ptr_eq(s, &lod.ready[&key]))
+        );
+        assert_eq!(lod.ready[&key].spans(cell), two_span_col.spans.as_slice());
+        assert_eq!(lod.ready[&key].surface(cell), None);
+        assert_eq!(lod.ready[&key].spans(cell - 1), initial.spans.as_slice());
+        assert_eq!(lod.ready[&key].surface(cell - 1), Some(initial_surface));
+        assert_eq!(lod.ready[&key].spans(cell + 1), initial.spans.as_slice());
+        assert_eq!(lod.ready[&key].surface(cell + 1), Some(initial_surface));
+
+        // Unshared: shrink cell from 2 spans to 0 spans in place.
+        lod.apply_detail(chunk, &reduced_empty);
+        assert_eq!(Arc::as_ptr(&lod.ready[&key]), ptr_before);
+        assert!(lod.ready[&key].spans(cell).is_empty());
+        assert_eq!(lod.ready[&key].spans(cell + 1), initial.spans.as_slice());
+        assert_eq!(lod.ready[&key].surface(cell + 1), Some(initial_surface));
+
+        // Shared with a mesh snapshot: must copy rather than mutate in place.
+        let snapshot = lod.mesh_samples.clone();
+        lod.apply_detail(chunk, &reduced_two);
+        assert_ne!(Arc::as_ptr(&lod.ready[&key]), ptr_before);
+        assert!(snapshot.get(&key).unwrap().spans(cell).is_empty());
+        assert_eq!(lod.ready[&key].spans(cell), two_span_col.spans.as_slice());
+        assert!(
+            lod.mesh_samples
+                .get(&key)
+                .is_some_and(|s| Arc::ptr_eq(s, &lod.ready[&key]))
+        );
+    }
+
+    #[test]
+    fn sharded_chunks_cow_isolates_snapshots_and_evicts_empty_shards() {
+        let mut live: ShardedChunks<Arc<TileColumns>> = ShardedChunks::default();
+        let a = Arc::new(TileColumns::from_columns(&[]));
+        let b = Arc::new(TileColumns::from_columns(&[]));
+        let c = Arc::new(TileColumns::from_columns(&[]));
+
+        // Place keys in distinct 8x8 shards across positive and negative quadrants.
+        assert!(live.insert((0, 0), a.clone()).is_none());
+        assert!(live.insert((1, 2), a.clone()).is_none());
+        assert!(live.insert((-9, -1), b.clone()).is_none());
+        assert!(live.insert((16, 16), c.clone()).is_none());
+        assert!(live.insert((32, -16), a.clone()).is_none());
+        assert_eq!(live.len(), 5);
+        assert_eq!(live.shards.len(), 4);
+
+        let snap = live.clone();
+        // Removing an absent key in a shared shard must not copy that shard.
+        let shard_key = ShardedChunks::<Arc<TileColumns>>::shard_of((32, -16));
+        let untouched_ptr = Arc::as_ptr(&live.shards[&shard_key]);
+        assert!(live.remove(&(33, -16)).is_none());
+        assert_eq!(
+            Arc::as_ptr(&live.shards[&shard_key]),
+            untouched_ptr,
+            "absent remove must not clone shared shard"
+        );
+
+        // Overwrite one key, insert in another shard, and empty a third shard.
+        assert!(live.insert((0, 0), c.clone()).is_some());
+        assert_eq!(live.len(), 5);
+        assert!(live.insert((17, 17), b.clone()).is_none());
+        assert_eq!(live.len(), 6);
+        assert!(live.remove(&(-9, -1)).is_some());
+        assert_eq!(live.len(), 5);
+        assert!(
+            !live
+                .shards
+                .contains_key(&ShardedChunks::<Arc<TileColumns>>::shard_of((-9, -1))),
+            "empty shard must be removed"
+        );
+
+        // Snapshot remains completely isolated; untouched shards still share Arcs.
+        assert_eq!(snap.len(), 5);
+        assert!(Arc::ptr_eq(&snap[&(0, 0)], &a));
+        assert!(Arc::ptr_eq(&live[&(0, 0)], &c));
+        assert!(snap.contains_key(&(-9, -1)));
+        assert!(!live.contains_key(&(-9, -1)));
+        assert!(!snap.contains_key(&(17, 17)));
+        assert!(Arc::ptr_eq(&live[&(17, 17)], &b));
+        assert!(Arc::ptr_eq(
+            &snap.shards[&shard_key],
+            &live.shards[&shard_key],
+        ));
+    }
+
+    #[test]
+    fn dispatch_meshes_shares_arc_snapshots_and_retries_on_lock_contention() {
+        let mut lod = Lod::scheduler_for_test();
+        let k0 = TileKey {
+            x: 0,
+            z: 0,
+            level: 0,
+        };
+        let k1 = TileKey {
+            x: 1,
+            z: 0,
+            level: 0,
+        };
+        let parent = TileKey {
+            x: 0,
+            z: 0,
+            level: 1,
+        };
+        Arc::make_mut(&mut lod.plan.nodes).extend([parent, k0, k1]);
+        Arc::make_mut(&mut lod.plan.split).insert(parent);
+        lod.full = [(5, 5), (2, -1)].into_iter().collect();
+        lod.leave_out();
+        assert!(
+            lod.cutout_pending
+                .as_ref()
+                .is_some_and(|pending| Arc::ptr_eq(pending, &lod.covered)),
+            "leave_out should share covered Arc with cutout_pending"
+        );
+
+        let visited_tile = TileColumns::empty();
+        let visited_reduced = Arc::new(ReducedColumns::from_tile(visited_tile.clone()));
+        lod.saved.insert((3, 4), visited_tile.clone());
+        lod.reduced.insert((3, 4), visited_reduced.clone());
+
+        for key in [k0, k1] {
+            lod.active.insert(key);
+            lod.ready.insert(key, TileColumns::empty());
+            lod.sync_sample(key);
+            lod.mark_mesh(key);
+        }
+
+        // Contended lock: dispatch returns without blocking or dropping dirty tiles.
+        {
+            let shared = Arc::clone(&lod.shared);
+            let _busy = shared.mesh_jobs.lock().unwrap();
+            lod.dispatch_meshes([0, 0]);
+            assert_eq!(lod.dirty.len(), 2);
+            assert_eq!(lod.outstanding_meshes, 0);
+            assert!(lod.mesh_cancel.is_empty());
+        }
+
+        // Uncontended: jobs are pushed with O(1) Arc-shared snapshot maps/sets.
+        lod.dispatch_meshes([0, 0]);
+        assert!(lod.dirty.is_empty());
+        assert_eq!(lod.outstanding_meshes, 2);
+        assert_eq!(lod.mesh_cancel.len(), 2);
+
+        let queued: Vec<_> = {
+            let mut heap = lod.shared.mesh_jobs.lock().unwrap();
+            std::iter::from_fn(|| heap.pop()).collect()
+        };
+        assert_eq!(queued.len(), 2);
+        let job = &queued[0].job;
+        assert!(Arc::ptr_eq(&job.snapshot.nodes, &lod.plan.nodes));
+        assert!(Arc::ptr_eq(&job.snapshot.split, &lod.plan.split));
+        assert!(Arc::ptr_eq(&job.covered, &lod.covered));
+        assert!(Arc::ptr_eq(
+            job.snapshot.saved.get(&(3, 4)).unwrap(),
+            &visited_tile
+        ));
+        assert!(Arc::ptr_eq(
+            job.snapshot.reduced.get(&(3, 4)).unwrap(),
+            &visited_reduced
+        ));
+
+        // Subsequent live mutations must not affect the in-flight job's snapshot.
+        lod.saved.remove(&(3, 4));
+        lod.full.insert((9, 9));
+        lod.leave_out();
+        assert!(job.snapshot.saved.contains_key(&(3, 4)));
+        assert!(!job.covered.contains(&(9, 9)));
+        assert!(lod.covered.contains(&(9, 9)));
+
+        // Cutout publishing unwraps or clones cleanly to the exact FxHashSet.
+        lod.cutout_waiting.clear();
+        lod.publish_cutout_if_ready();
+        assert_eq!(lod.take_cutout(), Some((*lod.covered).clone()));
+    }
+
+    #[test]
+    fn request_detail_defers_without_blocking_when_jobs_lock_is_busy() {
+        let mut lod = Lod::scheduler_for_test();
+        let key = TileKey {
+            x: 2,
+            z: 3,
+            level: 0,
+        };
+        lod.active.insert(key);
+        let old_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        lod.detail_request_at = old_at;
+
+        // While the worker holds `shared.jobs`, `request_detail` must not block,
+        // must not wedge `detail_request_pending`, and must not reset the 250 ms timer.
+        {
+            let shared = Arc::clone(&lod.shared);
+            let _busy = shared.jobs.lock().unwrap();
+            lod.request_detail([0, 0]);
+            assert!(!lod.detail_request_pending);
+            assert_eq!(lod.detail_request_at, old_at);
+        }
+
+        // Next frame once free: immediately enqueues `Job::RequestDetail`.
+        lod.request_detail([0, 0]);
+        assert!(lod.detail_request_pending);
+        assert!(lod.detail_request_at > old_at);
+        let queued = lod.shared.jobs.lock().unwrap().pop_front();
+        assert!(
+            matches!(queued, Some(Job::RequestDetail { chunks, .. }) if chunks == vec![(2, 3)])
+        );
+    }
+
+    #[test]
+    fn tile_overlaps_covered_matches_linear_scan_across_levels_and_bounds() {
+        let naive = |key: TileKey, covered: &FxHashSet<(i32, i32)>| {
+            let [ox, _, oz] = key.origin();
+            let size = key.size();
+            covered.iter().any(|&(cx, cz)| {
+                let x = cx * 16;
+                let z = cz * 16;
+                x < ox + size && x + 16 > ox && z < oz + size && z + 16 > oz
+            })
+        };
+        let bounds_of = |covered: &FxHashSet<(i32, i32)>| {
+            covered.iter().fold(None::<[i32; 4]>, |bounds, &(x, z)| {
+                Some(match bounds {
+                    None => [x * 16, z * 16, (x + 1) * 16, (z + 1) * 16],
+                    Some([x0, z0, x1, z1]) => [
+                        x0.min(x * 16),
+                        z0.min(z * 16),
+                        x1.max((x + 1) * 16),
+                        z1.max((z + 1) * 16),
+                    ],
+                })
+            })
+        };
+        let cases: Vec<FxHashSet<(i32, i32)>> = vec![
+            FxHashSet::default(),
+            [(-1, -1)].into_iter().collect(),
+            [(-5, 3), (4, -2)].into_iter().collect(),
+            (-3..=3)
+                .flat_map(|x| (-3..=3).map(move |z| (x, z)))
+                .filter(|(x, z)| ((x + z) & 1) == 0)
+                .collect(),
+            [(-20, -20), (20, 20)].into_iter().collect(),
+        ];
+        for covered in cases {
+            let bounds = bounds_of(&covered);
+            for level in 0..=5u8 {
+                for x in -8..=8 {
+                    for z in -8..=8 {
+                        let key = TileKey { x, z, level };
+                        let expected = naive(key, &covered);
+                        assert_eq!(
+                            tile_overlaps_covered(key, &covered, bounds),
+                            expected,
+                            "bounds mismatch for {key:?}"
+                        );
+                        assert_eq!(
+                            tile_overlaps_covered(key, &covered, None),
+                            expected,
+                            "no-bounds mismatch for {key:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lod_worker_sort_and_pack_matches_full_sort_solid_without_meshlets() {
+        use crate::mesher::{OPAQUE_LAYER, QuadLook, TerrainVertex};
+        let quad = |positions: [[f32; 3]; 4], layer: u16, color: u32| {
+            positions.map(|pos| TerrainVertex::tiled(pos, [0.0, 0.0], layer, color, 0xF0F0))
+        };
+        let build = || {
+            let mut solid = Vec::new();
+            solid.extend(quad(
+                [
+                    [0.0, 64.0, 0.0],
+                    [0.0, 64.0, 16.0],
+                    [16.0, 64.0, 16.0],
+                    [16.0, 64.0, 0.0],
+                ],
+                OPAQUE_LAYER | 2,
+                0xFF22_8833,
+            ));
+            solid.extend(quad(
+                [
+                    [16.0, 48.0, 0.0],
+                    [16.0, 64.0, 0.0],
+                    [16.0, 64.0, 16.0],
+                    [16.0, 48.0, 16.0],
+                ],
+                OPAQUE_LAYER | 5,
+                0xFF77_6655,
+            ));
+            solid.extend(quad(
+                [
+                    [0.0, 48.0, 16.0],
+                    [0.0, 64.0, 16.0],
+                    [16.0, 64.0, 16.0],
+                    [16.0, 48.0, 16.0],
+                ],
+                7,
+                0xFF44_AA44,
+            ));
+            let translucent = quad(
+                [
+                    [0.0, 62.0, 0.0],
+                    [0.0, 62.0, 16.0],
+                    [16.0, 62.0, 16.0],
+                    [16.0, 62.0, 0.0],
+                ],
+                9,
+                0x8033_55EE,
+            )
+            .to_vec();
+            SectionMesh {
+                solid,
+                translucent,
+                solid_looks: vec![QuadLook([10, 20]), QuadLook([30, 40]), QuadLook([50, 60])],
+                ..Default::default()
+            }
+        };
+
+        let mut reference = build();
+        reference.sort_solid();
+        packed::lay_out(&mut reference);
+
+        let mut fast = build();
+        fast.sort_solid_for_lod();
+        packed::lay_out(&mut fast);
+
+        assert_eq!(
+            bytemuck::cast_slice::<TerrainVertex, u32>(&fast.solid),
+            bytemuck::cast_slice::<TerrainVertex, u32>(&reference.solid),
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<TerrainVertex, u32>(&fast.translucent),
+            bytemuck::cast_slice::<TerrainVertex, u32>(&reference.translucent),
+        );
+        assert_eq!(fast.sides, reference.sides);
+        assert_eq!(fast.bounds, reference.bounds);
+        assert_eq!(fast.packed, reference.packed);
+        assert_eq!(fast.packed_far, reference.packed_far);
+        assert_eq!(fast.solid_looks, reference.solid_looks);
+        assert!(fast.meshlets.is_empty());
+        assert_eq!(fast.meshlets.capacity(), 0);
+    }
+
+    fn reference_summarize(chunk: &Chunk, kinds: &[u8]) -> [Column; 256] {
+        let water = water_source(kinds);
+        std::array::from_fn(|i| {
+            Column::from_chunk(chunk, kinds, water, (i & 15) as i32, (i >> 4) as i32)
+        })
+    }
+
+    fn assert_summarize_matches_reference(chunk: &Chunk, kinds: &[u8], label: &str) {
+        let actual = summarize(chunk, kinds);
+        let expected = reference_summarize(chunk, kinds);
+        for col in 0..256 {
+            assert_eq!(
+                actual[col],
+                expected[col],
+                "{label}: mismatch at column ({}, {})",
+                col & 15,
+                col >> 4
+            );
+        }
+    }
+
+    #[test]
+    fn summarize_matches_column_from_chunk_across_chunk_shapes() {
+        use crate::chunk::{BIOME_STRATEGY, ColumnLayout, Light, Section, block_strategy};
+        use horizon_core::paletted::PalettedContainer;
+
+        // 0: air, 1: non-kept grass/cave_air, 2: stone, 3: deepslate,
+        // 4: water, 5: kelp (watery), 6: seagrass (watery),
+        // 7: glowstone (emit 15), 8: lava (fluid + emit 15),
+        // 9: magma (emit 3), 10: non-kept torch (emit 14).
+        let kinds = [
+            AIR,
+            0,
+            KEPT,
+            KEPT,
+            KEPT | FLUID,
+            KEPT | FLUID | WATERY,
+            KEPT | FLUID | WATERY,
+            KEPT | (15 << 4),
+            KEPT | FLUID | (15 << 4),
+            KEPT | (3 << 4),
+            14 << 4,
+        ];
+
+        let sky_light = |block: u8, salt: usize| {
+            let arr: [u8; 4096] =
+                std::array::from_fn(|i| ((((i * 7 + salt) & 15) as u8) << 4) | (block & 15));
+            let light = Light::from_slice(&arr);
+            assert!(matches!(light, Light::Sky(..)));
+            light
+        };
+        let block_light = |sky: u8, salt: usize| {
+            let arr: [u8; 4096] =
+                std::array::from_fn(|i| ((sky & 15) << 4) | (((i * 11 + salt) & 15) as u8));
+            let light = Light::from_slice(&arr);
+            assert!(matches!(light, Light::Block(..)));
+            light
+        };
+        let full_light = |salt: usize| {
+            let arr: [u8; 4096] = std::array::from_fn(|i| {
+                ((((i * 5 + salt) & 15) as u8) << 4) | (((i * 13 + (i >> 4) + salt) & 15) as u8)
+            });
+            let light = Light::from_slice(&arr);
+            assert!(matches!(light, Light::Full(_)));
+            light
+        };
+
+        // 1. Empty zero-section chunk & all-air chunk.
+        let mut zero_sections = Chunk::empty(0, 0);
+        zero_sections.sections.clear();
+        assert_summarize_matches_reference(&zero_sections, &kinds, "zero sections");
+        assert_summarize_matches_reference(&Chunk::empty(0, 0), &kinds, "all-air chunk");
+
+        // 2. Multi-section chunk exercising every fast path & boundary transition:
+        //    - sy 0: uniform stone, Light::Uniform(0x00) at bottom boundary (below = 0x00)
+        //    - sy 1: uniform glowstone (emit 15), Light::Uniform(0x00), next to Light::Uniform(0x07)
+        //    - sy 2: uniform deepslate, Light::Uniform(0x07), mixed biomes (4 quart-Y bands)
+        //    - sy 3: uncompacted uniform stone (List palette with stale air) + Light::Sky
+        //    - sy 4: uniform stone + Light::Uniform(0x23) between Light::Sky and Light::Block
+        //    - sy 5: subterranean cave + emitting blocks + Light::Block (border/corner 7-neighbor)
+        //    - sy 6: ocean section of water + kelp + seagrass ONLY (all_same -> uniform kept!)
+        //    - sy 7: uncompacted uniform air (List palette with stale stone) + Light::Full
+        //    - sy 8: non-kept multi-block palette (air + grass + torch) + Light::Full
+        //    - sy 9: bridge over water + mixed surface + out-of-range block IDs + Light::Full
+        //    - sy 10: Palette::Global (>256 distinct states) + Light::Uniform(0x92)
+        //    - sy 11: Palette::Global (>256 distinct states) + Light::Full
+        //    - sy 12: uncompacted uniform Palette::Global + Light::Uniform(0x41)
+        //    - sy 13: uniform stone at top of chunk (above = 0xF0!) with Light::Uniform(0x00)
+        let layout = ColumnLayout::new(-64, 14 * 16).unwrap();
+        let mut sections = Vec::with_capacity(14);
+
+        // sy 0
+        sections.push(Section {
+            blocks: PalettedContainer::new(block_strategy(), 2),
+            biomes: PalettedContainer::new(BIOME_STRATEGY, 1),
+            light: Light::Uniform(0x00),
+        });
+        // sy 1: uniform glowstone (emission 15 masks neighbor block light 7)
+        sections.push(Section {
+            blocks: PalettedContainer::new(block_strategy(), 7),
+            biomes: PalettedContainer::new(BIOME_STRATEGY, 2),
+            light: Light::Uniform(0x00),
+        });
+        // sy 2: uniform deepslate with 4 quart-Y biomes and non-uniform above boundary
+        let mixed_biomes = PalettedContainer::from_values(
+            BIOME_STRATEGY,
+            &std::array::from_fn::<u32, 64, _>(|i| {
+                ((i >> 4) * 3 + (i & 3) + ((i >> 2) & 3) * 2) as u32
+            }),
+        );
+        sections.push(Section {
+            blocks: PalettedContainer::new(block_strategy(), 3),
+            biomes: mixed_biomes.clone(),
+            light: Light::Uniform(0x07),
+        });
+        // sy 3: uncompacted uniform stone (bits > 0, stale air) + Light::Sky
+        let mut uncompacted_stone = PalettedContainer::new(block_strategy(), 2);
+        uncompacted_stone.set(0, 0);
+        uncompacted_stone.set(0, 2);
+        assert!(uncompacted_stone.bits() > 0 && uncompacted_stone.uniform() == Some(2));
+        let mut uncompacted_biome = PalettedContainer::new(BIOME_STRATEGY, 5);
+        uncompacted_biome.set(0, 9);
+        uncompacted_biome.set(0, 5);
+        assert!(uncompacted_biome.bits() > 0 && uncompacted_biome.uniform() == Some(5));
+        sections.push(Section {
+            blocks: uncompacted_stone,
+            biomes: uncompacted_biome,
+            light: sky_light(2, 3),
+        });
+        // sy 4: uniform stone + Light::Uniform(0x23) between Sky below and Block above
+        sections.push(Section {
+            blocks: PalettedContainer::new(block_strategy(), 2),
+            biomes: PalettedContainer::new(BIOME_STRATEGY, 4),
+            light: Light::Uniform(0x23),
+        });
+        // sy 5: subterranean caves + magma/lava/glowstone + borders/corners + Light::Block
+        let cave_blocks: [u32; 4096] = std::array::from_fn(|i| {
+            let x = i & 15;
+            let z = (i >> 4) & 15;
+            let y = i >> 8;
+            if x == 0 || x == 15 || z == 0 || z == 15 {
+                if (x + y + z).is_multiple_of(3) { 2 } else { 0 }
+            } else if y == 0 || y == 15 {
+                if (x + z).is_multiple_of(2) { 9 } else { 8 }
+            } else if (x * 3 + y * 5 + z * 7).is_multiple_of(4) {
+                7
+            } else {
+                0
+            }
+        });
+        sections.push(Section {
+            blocks: Section::from_blocks(&cave_blocks),
+            biomes: mixed_biomes.clone(),
+            light: block_light(4, 5),
+        });
+        // sy 6: ocean section of ONLY water + kelp + seagrass (collapses to uniform water!)
+        let ocean_blocks: [u32; 4096] = std::array::from_fn(|i| match i % 3 {
+            0 => 4,
+            1 => 5,
+            _ => 6,
+        });
+        sections.push(Section {
+            blocks: Section::from_blocks(&ocean_blocks),
+            biomes: mixed_biomes.clone(),
+            light: sky_light(0, 6),
+        });
+        // sy 7: uncompacted uniform air (stale stone in list palette) + Light::Full
+        let mut uncompacted_air = PalettedContainer::new(block_strategy(), 0);
+        uncompacted_air.set(0, 2);
+        uncompacted_air.set(0, 0);
+        assert!(uncompacted_air.bits() > 0 && uncompacted_air.uniform() == Some(0));
+        sections.push(Section {
+            blocks: uncompacted_air,
+            biomes: PalettedContainer::new(BIOME_STRATEGY, 6),
+            light: full_light(7),
+        });
+        // sy 8: non-kept multi-block list palette (air + grass + torch)
+        let nonkept_blocks: [u32; 4096] = std::array::from_fn(|i| match i % 3 {
+            0 => 0,
+            1 => 1,
+            _ => 10,
+        });
+        sections.push(Section {
+            blocks: Section::from_blocks(&nonkept_blocks),
+            biomes: PalettedContainer::new(BIOME_STRATEGY, 7),
+            light: full_light(8),
+        });
+        // sy 9: bridge over water + kelp + out-of-range block states (>= kinds.len())
+        let surface_blocks: [u32; 4096] = std::array::from_fn(|i| {
+            let x = i & 15;
+            let z = (i >> 4) & 15;
+            let y = i >> 8;
+            if y < 6 {
+                if x < 8 { 4 } else { 5 }
+            } else if y == 10 && (4..12).contains(&x) && (4..12).contains(&z) {
+                2
+            } else if y == 12 && x == 0 && z == 15 {
+                999
+            } else {
+                0
+            }
+        });
+        sections.push(Section {
+            blocks: Section::from_blocks(&surface_blocks),
+            biomes: mixed_biomes.clone(),
+            light: full_light(9),
+        });
+        // sy 10: Palette::Global (>256 distinct states) + Light::Uniform(0x92)
+        let mut global_a = PalettedContainer::new(block_strategy(), 0);
+        for i in 0..4096usize {
+            let state = if i < 300 {
+                i as u32
+            } else {
+                (i % (kinds.len() + 3)) as u32
+            };
+            global_a.set(i, state);
+        }
+        assert!(global_a.is_global());
+        sections.push(Section {
+            blocks: global_a,
+            biomes: mixed_biomes.clone(),
+            light: Light::Uniform(0x92),
+        });
+        // sy 11: Palette::Global + Light::Full
+        let mut global_b = PalettedContainer::new(block_strategy(), 0);
+        for i in 0..4096usize {
+            let state = if i < 280 {
+                (i + 5) as u32
+            } else {
+                ((i * 3) % (kinds.len() + 2)) as u32
+            };
+            global_b.set(i, state);
+        }
+        assert!(global_b.is_global());
+        sections.push(Section {
+            blocks: global_b,
+            biomes: mixed_biomes,
+            light: full_light(11),
+        });
+        // sy 12: uncompacted uniform Palette::Global (all entries overwritten to stone)
+        let mut global_uniform = PalettedContainer::new(block_strategy(), 0);
+        for i in 0..280u32 {
+            global_uniform.set(i as usize, i);
+        }
+        assert!(global_uniform.is_global());
+        for i in 0..4096usize {
+            global_uniform.set(i, 2);
+        }
+        assert!(global_uniform.is_global() && global_uniform.uniform() == Some(2));
+        sections.push(Section {
+            blocks: global_uniform,
+            biomes: PalettedContainer::new(BIOME_STRATEGY, 11),
+            light: Light::Uniform(0x41),
+        });
+        // sy 13: top section uniform stone with Light::Uniform(0x00) -> above = 0xF0 lights dy = 15
+        sections.push(Section {
+            blocks: PalettedContainer::new(block_strategy(), 2),
+            biomes: PalettedContainer::new(BIOME_STRATEGY, 12),
+            light: Light::Uniform(0x00),
+        });
+
+        let chunk = Chunk::from_sections(0, 0, layout, &mut sections);
+        assert_summarize_matches_reference(&chunk, &kinds, "all fast paths and boundaries");
+
+        // 3. Fluid-only chunk (water + lava stacked, no solid below) with different kinds tables.
+        let fluid_layout = ColumnLayout::new(0, 32).unwrap();
+        let mut fluid_sections = vec![
+            Section {
+                blocks: Section::from_blocks(&std::array::from_fn(|i| {
+                    let y = i >> 8;
+                    if y < 6 {
+                        8
+                    } else if y < 12 {
+                        5
+                    } else {
+                        4
+                    }
+                })),
+                biomes: PalettedContainer::from_values(
+                    BIOME_STRATEGY,
+                    &std::array::from_fn::<u32, 64, _>(|i| (i + 10) as u32),
+                ),
+                light: sky_light(3, 13),
+            },
+            Section {
+                blocks: Section::from_blocks(&std::array::from_fn(|i| {
+                    if (i >> 8) < 5 { 4 } else { 0 }
+                })),
+                biomes: PalettedContainer::from_values(
+                    BIOME_STRATEGY,
+                    &std::array::from_fn::<u32, 64, _>(|i| (i + 80) as u32),
+                ),
+                light: Light::Uniform(0xF5),
+            },
+        ];
+        let fluid_chunk = Chunk::from_sections(0, 0, fluid_layout, &mut fluid_sections);
+        assert_summarize_matches_reference(&fluid_chunk, &kinds, "fluid-only standard kinds");
+
+        // Weird kinds: state 0 is KEPT, no water_source (lava has emission), AIR at index 3.
+        let weird_kinds = [
+            KEPT | (5 << 4),
+            KEPT | FLUID | WATERY,
+            KEPT | FLUID | (15 << 4),
+            AIR,
+            0,
+        ];
+        assert_eq!(water_source(&weird_kinds), None);
+        assert_summarize_matches_reference(&fluid_chunk, &weird_kinds, "state 0 kept, no water");
+
+        // No AIR bit at all in kinds table: the fluid-only surface falls back to state 0.
+        let mut no_air_kinds = kinds;
+        no_air_kinds[0] = 0;
+        assert_summarize_matches_reference(&fluid_chunk, &no_air_kinds, "fluid-only no AIR bit");
+        let surface = summarize(&fluid_chunk, &no_air_kinds)[0].surface;
+        assert_eq!(
+            surface.map(|s| (s.height, s.state, s.water)),
+            Some((0, BlockStateId(0), Some((21, BlockStateId(4))))),
+            "a fluid-only column keeps its water surface without an AIR state"
+        );
+
+        // Empty kinds table.
+        assert_summarize_matches_reference(&chunk, &[], "empty kinds table");
+
+        // 4. Custom layouts: extreme single-section (-2032, 16) where sy == 0 AND sy == last,
+        //    plus extended Overworld (-128, 448).
+        let single_layout = ColumnLayout::new(-2032, 16).unwrap();
+        let mut single_sections = vec![Section {
+            blocks: PalettedContainer::new(block_strategy(), 2),
+            biomes: PalettedContainer::new(BIOME_STRATEGY, 17),
+            light: Light::Uniform(0xF5),
+        }];
+        let single_chunk = Chunk::from_sections(0, 0, single_layout, &mut single_sections);
+        assert_summarize_matches_reference(&single_chunk, &kinds, "single section -2032/16");
+
+        let tall_layout = ColumnLayout::new(-128, 448).unwrap();
+        let mut tall_chunk = Chunk::with_layout(0, 0, tall_layout);
+        for x in 0..16 {
+            for z in 0..16 {
+                tall_chunk.set(x, -128, z, 3);
+                tall_chunk.set(x, 0, z, 4);
+                tall_chunk.set(x, 319, z, 7);
+            }
+        }
+        assert_summarize_matches_reference(&tall_chunk, &kinds, "tall layout -128/448");
+    }
+
+    #[test]
+    fn summarize_randomized_differential_fuzz() {
+        use crate::chunk::{BIOME_STRATEGY, ColumnLayout, Light, Section, block_strategy};
+        use horizon_core::paletted::PalettedContainer;
+
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let kinds_tables: [&[u8]; 3] = [
+            &[
+                AIR,
+                0,
+                KEPT,
+                KEPT,
+                KEPT | FLUID,
+                KEPT | FLUID | WATERY,
+                KEPT | (15 << 4),
+                KEPT | FLUID | (15 << 4),
+                12 << 4,
+            ],
+            &[KEPT | (4 << 4), KEPT | FLUID | WATERY, AIR, 0],
+            &[0, KEPT | FLUID, KEPT | FLUID | WATERY],
+        ];
+        let layouts = [
+            ColumnLayout::new(-64, 64).unwrap(),
+            ColumnLayout::new(0, 80).unwrap(),
+            ColumnLayout::new(-128, 48).unwrap(),
+        ];
+
+        for (t_idx, &kinds) in kinds_tables.iter().enumerate() {
+            let n = kinds.len() as u32;
+            for trial in 0..6usize {
+                let layout = layouts[(t_idx + trial) % layouts.len()];
+                let mut sections = Vec::with_capacity(layout.sections());
+                for _ in 0..layout.sections() {
+                    let blocks = match next() % 7 {
+                        0 => PalettedContainer::new(block_strategy(), (next() as u32) % (n + 2)),
+                        1 => {
+                            let base = (next() as u32) % (n + 1);
+                            let stale = (base + 1) % (n + 1);
+                            let mut c = PalettedContainer::new(block_strategy(), base);
+                            c.set(0, stale);
+                            c.set(0, base);
+                            c
+                        }
+                        2 => {
+                            // Palette::Global section.
+                            let mut c = PalettedContainer::new(block_strategy(), 0);
+                            for i in 0..270u32 {
+                                c.set(i as usize, i);
+                            }
+                            for i in 270..4096usize {
+                                c.set(i, (next() as u32) % (n + 3));
+                            }
+                            c
+                        }
+                        _ => {
+                            let vals: [u32; 4096] =
+                                std::array::from_fn(|_| (next() as u32) % (n + 2));
+                            Section::from_blocks(&vals)
+                        }
+                    };
+                    let biomes = match next() % 4 {
+                        0 => PalettedContainer::new(BIOME_STRATEGY, (next() as u32) % 32),
+                        1 => {
+                            let b = (next() as u32) % 32;
+                            let mut c = PalettedContainer::new(BIOME_STRATEGY, b);
+                            c.set(0, (b + 1) % 32);
+                            c.set(0, b);
+                            c
+                        }
+                        2 => {
+                            let vals: [u32; 64] = std::array::from_fn(|_| (next() as u32) % 6);
+                            PalettedContainer::from_values(BIOME_STRATEGY, &vals)
+                        }
+                        _ => {
+                            // >8 distinct biomes -> Palette::Global for biomes.
+                            let vals: [u32; 64] = std::array::from_fn(|i| (i as u32) % 16);
+                            PalettedContainer::from_values(BIOME_STRATEGY, &vals)
+                        }
+                    };
+                    let light = match next() % 4 {
+                        0 => Light::Uniform((next() & 0xFF) as u8),
+                        1 => {
+                            let blk = (next() & 15) as u8;
+                            let arr: [u8; 4096] =
+                                std::array::from_fn(|_| (((next() & 15) as u8) << 4) | blk);
+                            Light::from_slice(&arr)
+                        }
+                        2 => {
+                            let sky = ((next() & 15) as u8) << 4;
+                            let arr: [u8; 4096] =
+                                std::array::from_fn(|_| sky | ((next() & 15) as u8));
+                            Light::from_slice(&arr)
+                        }
+                        _ => {
+                            let arr: [u8; 4096] = std::array::from_fn(|_| (next() & 0xFF) as u8);
+                            Light::from_slice(&arr)
+                        }
+                    };
+                    sections.push(Section {
+                        blocks,
+                        biomes,
+                        light,
+                    });
+                }
+                let chunk = Chunk::from_sections(0, 0, layout, &mut sections);
+                assert_summarize_matches_reference(
+                    &chunk,
+                    kinds,
+                    &format!("fuzz table={t_idx} trial={trial}"),
+                );
+            }
+        }
+    }
+}
