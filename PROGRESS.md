@@ -23,7 +23,7 @@ d'outil observé, « supposé » = non vérifié.
 - [x] docs/ARCHITECTURE.md
 - [x] docs/MODULES.md (75 dépôts classés, ~65 écartés comme non-mods)
 - [x] docs/ROADMAP.md
-- [ ] Validation utilisateur des documents et décisions D1-D8
+- [x] Validation utilisateur des documents (25/11 ; D5 à sa charge, D7-D8 ouvertes)
 
 ### Phase 0 — Dépôt et CI
 - [x] Monorepo local (subtrees `engine/`, `launcher/`, remotes `upstream-horizon`, `upstream-onelauncher`) — constaté
