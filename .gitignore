@@ -1,0 +1,33 @@
+# Build outputs
+target/
+**/target/
+.local/
+**/.local/
+
+# Prepared Minecraft resources and Mojang files: never committed
+/prepared/
+**/horizon-client/26.*/
+*.jar
+!engine/**/gradle-wrapper.jar
+*.class
+/minecraft/
+/assets/minecraft/
+
+# Test game folders and runtime files
+/run/
+/saves/
+/screenshots/
+/crash-reports/
+/logs/
+/options.txt
+/horizon-*.txt
+/engine/horizon-*.txt
+/pvp-client/
+*.hzperf
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+__pycache__/
