@@ -226,7 +226,11 @@ pub trait Module: Sync + 'static {
     fn on_enable(&self, _cx: &mut Cx) {}
     fn on_disable(&self, _cx: &mut Cx) {}
     fn on_setting(&self, _id: &str, _cx: &mut Cx) {}
-    fn on_event(&self, _ev: &mut Event<'_>, _cx: &mut Cx) {}
+    // Une méthode par événement, avec un défaut vide, comme `mod_api::Hooks` :
+    fn tick(&self, _cx: &Cx, _host: &mut dyn ClientHost) {}
+    fn key(&self, _cx: &Cx, _host: &mut dyn ClientHost, _ev: &InputKeyEvent<'_>) {}
+    fn gui_layer(&self, _cx: &Cx, _host: &dyn ClientHost, _ev: &mut GuiLayerPreEvent<'_>) -> Flow { Flow::Continue }
+    // … name_tag, level_stage, fov ; implémenté dans engine/crates/pvp-core/src/module.rs
 }
 
 pub enum Setting { Toggle{..}, Slider{min, max, step, ..}, Choice{..}, Color{..}, Key{..}, Text{..} }
@@ -282,6 +286,12 @@ magnétisme sur les bords d'écran, le centre et les autres éléments (seuil 4 
 ---
 
 ## 5. Menu in-game (pvp-ui)
+
+**Décision du 25/11/2026 : reprendre à l'identique l'UI de OneClient** (menu OneConfig, HUD et éditeur de HUD,
+launcher OneClient), au lieu d'un design original. La consigne de style initiale (« sans copier l'identité
+visuelle ») est remplacée par celle-ci. `pvp-ui` reproduira la mise en page, les couleurs, la typographie et les
+interactions de OneConfig/PolyUI après étude de leur code (licences des assets à vérifier).
+
 
 Ouverture par **Shift droit** (mapping enregistré, re-bindable) ; recherche instantanée sur nom,
 description et réglages ; catégories HUD, PvP, Chat, Visuel, Performance ; carte par module avec

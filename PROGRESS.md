@@ -6,8 +6,12 @@ d'outil observé, « supposé » = non vérifié.
 
 ## État courant (2026-11-25)
 
-- Étape : **exploration et documents terminés, en attente de validation** (point d'arrêt n° 1).
-- Aucun code écrit, aucun dépôt GitHub créé, rien poussé.
+- Documents validés le 25/11 (D1-D4, D6 ; fair-play : toutes les fonctionnalités Polyfrost autorisées).
+- Nouvelle consigne : **reprendre à l'identique l'UI de OneClient/OneConfig** (menu, HUD, launcher).
+- Dépôt privé : https://github.com/valthvn/rust-pvp-client (subtrees `engine/` = Horizon ae632edf48,
+  `launcher/` = OneLauncher 39f0cf3).
+- Phase 0 en cours (CI), phase 1 commencée (`pvp-core` écrit, testé localement).
+- Session arrêtée à la demande de l'utilisateur après ce lot.
 
 ## Checklist
 
@@ -22,14 +26,30 @@ d'outil observé, « supposé » = non vérifié.
 - [ ] Validation utilisateur des documents et décisions D1-D8
 
 ### Phase 0 — Dépôt et CI
-- [ ] Monorepo local (subtrees `engine/`, `launcher/`, remotes upstream)
-- [ ] Dépôt GitHub privé, push
+- [x] Monorepo local (subtrees `engine/`, `launcher/`, remotes `upstream-horizon`, `upstream-onelauncher`) — constaté
+- [x] Dépôt GitHub privé, push — constaté (visibility PRIVATE)
 - [ ] ci.yml vert (Linux), puis matrice complète sur main
-- [ ] build.yml (artifacts)
+      - run 45695282544 : engine macOS ✅ (clippy horizon-game 2 min 23 s), engine Windows ✅,
+        engine Linux : en cours à l'arrêt de session ; launcher ❌ sur les 3 OS (OneLauncher amont non
+        conforme à rustfmt stable / clippy -D warnings) → ci.yml corrigé : vérification stricte seulement
+        sur nos crates du launcher, clippy amont en rapport seulement. À revérifier.
+- [ ] build.yml (artifacts) — run 45695282620 : les builds macOS client et launcher compilent, mais
+      **l'upload échoue : quota de stockage d'artifacts du compte GitHub atteint** (partagé entre dépôts
+      privés). Rétention réduite à 3 jours. Action utilisateur : libérer des artifacts ou augmenter le quota.
 - [ ] e2e.yml (selon D4)
 - [ ] Benchmark de référence (docs/PERF.md)
 
-### Phase 1 / 2 / 3 / 4
+### Phase 1
+- [~] 1.2-1.4 `pvp-core` : trait `Module` (une méthode par événement), schéma `Setting`, registre à masques
+      atomiques (dispatch sans allocation, panique → module désactivé), profils TOML versionnés (migrations,
+      .bak, écriture atomique, dupliquer/renommer/supprimer/importer/exporter), placement HUD (ancres,
+      magnétisme), adaptateur `mod_api` (`runtime.rs`, keybinds `pvp:<module>.<id>`).
+      Constaté localement : 17 tests OK, clippy -D warnings OK. Pas encore vérifié en CI ni en jeu.
+      Limite : l'échelle des éléments HUD est stockée mais pas rendue (pas de mise à l'échelle dans `DrawContext`).
+- [ ] 1.1 `pvp-client` (exécutable, `main_with`), 1.5 keybinds/Shift droit, 1.6 menu (UI OneConfig), 1.7 éditeur HUD
+- Prochaine étape : étudier OneConfig/PolyUI (UI à reproduire), écrire `pvp-client`, e2e horizon-ctl.
+
+### Phase 2 / 3 / 4
 Voir docs/ROADMAP.md ; détaillées ici au démarrage de chaque phase.
 
 ## Blocages et constats importants

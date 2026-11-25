@@ -12,6 +12,8 @@ members = [
     "crates/horizon-official",
     "crates/horizon-heartbeat",
     "crates/horizon-name-tag",
+    # The PvP client (repository root docs/ARCHITECTURE.md): our crates, kept apart from Horizon's.
+    "crates/pvp-core",
 
     "crates/horizon-core",
     "crates/horizon-platform",

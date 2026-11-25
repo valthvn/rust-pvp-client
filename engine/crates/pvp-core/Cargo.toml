@@ -1,0 +1,16 @@
+[package]
+name = "pvp-core"
+version = "0.1.0"
+edition.workspace = true
+license = "GPL-3.0-or-later"
+rust-version.workspace = true
+description = "PvP client core: the Module trait, registry and lifecycle, event dispatch, versioned profiles, keybinds and HUD placement (docs/ARCHITECTURE.md at the repository root)"
+
+[dependencies]
+horizon-mod-api = { path = "../horizon-mod-api" }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[lints]
+workspace = true
