@@ -1,0 +1,26 @@
+[package]
+name = "pvp-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-3.0-or-later"
+description = "The PvP client executable: Horizon's game with the pvp-core runtime and its modules linked in"
+
+[[bin]]
+name = "pvp-client"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+# The game as horizon-official builds it (same features: audio, controllers, extras).
+horizon-game = { path = "../horizon-game" }
+horizon-guest-stack = { path = "../horizon-guest-stack" }
+horizon-client = { path = "../horizon-client", default-features = false }
+horizon-mod-host = { path = "../horizon-mod-host", default-features = false }
+horizon-mod-package = { path = "../horizon-mod-package", default-features = false, features = ["index"] }
+pvp-core = { path = "../pvp-core" }
+pvp-ui = { path = "../pvp-ui" }
+pvp-modules = { path = "../pvp-modules" }
+
+[lints]
+workspace = true

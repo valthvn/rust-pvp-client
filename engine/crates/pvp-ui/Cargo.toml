@@ -1,0 +1,18 @@
+[package]
+name = "pvp-ui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-3.0-or-later"
+description = "The PvP client's in-game UI (OneConfig's look): menu, HUD editor and the drawing they share"
+
+[dependencies]
+horizon-mod-api = { path = "../horizon-mod-api" }
+pvp-core = { path = "../pvp-core" }
+ab_glyph = "0.2.32"
+# The OneConfig icons are SVG: rasterized at the screen's pixel size, tinted when drawn.
+resvg = { version = "0.45", default-features = false }
+log = "0.4"
+
+[lints]
+workspace = true

@@ -4,7 +4,12 @@ Mémoire de travail du projet. À relire, avec `git log`, au début de chaque se
 Règle : une tâche n'est cochée que si son workflow CI est vert (lien) ; « constaté » = résultat
 d'outil observé, « supposé » = non vérifié.
 
-## État courant (2026-11-25)
+## État courant (2026-11-26)
+
+- **Bloquant (action utilisateur) : GitHub Actions ne démarre plus aucun job** — annotation constatée sur le
+  run 45764065757 (branche `phase1`) : « recent account payments have failed or your spending limit needs to be
+  increased ». À régler dans Billing & plans du compte. En attendant : travail et tests en local, CI à rejouer.
+- Travail en cours sur la branche `phase1` (main inchangé depuis 923c072).
 
 - Documents validés le 25/11 (D1-D4, D6 ; fair-play : toutes les fonctionnalités Polyfrost autorisées).
 - Nouvelle consigne : **reprendre à l'identique l'UI de OneClient/OneConfig** (menu, HUD, launcher).
@@ -29,6 +34,11 @@ d'outil observé, « supposé » = non vérifié.
 - [x] Monorepo local (subtrees `engine/`, `launcher/`, remotes `upstream-horizon`, `upstream-onelauncher`) — constaté
 - [x] Dépôt GitHub privé, push — constaté (visibility PRIVATE)
 - [ ] ci.yml vert (Linux), puis matrice complète sur main
+      - run 45702723724 (923c072) : engine macOS ✅, Windows ✅ ; engine Linux ❌ tué (exit 137, mémoire) pendant
+        la compilation des tests ; launcher ❌ : `oneclient_db` (tests) utilise des `sqlx::query!` absents du cache
+        hors ligne `.sqlx`. Correctif db48831 (branche phase1) : swap 12 Go + tests sans debuginfo, 3 jobs ;
+        clippy amont `continue-on-error` sans `--all-targets`, tests launcher sans `oneclient_db`.
+        Non vérifié : la CI ne démarre plus (facturation, voir État courant).
       - run 45695282544 : engine macOS ✅ (clippy horizon-game 2 min 23 s), engine Windows ✅,
         engine Linux : en cours à l'arrêt de session ; launcher ❌ sur les 3 OS (OneLauncher amont non
         conforme à rustfmt stable / clippy -D warnings) → ci.yml corrigé : vérification stricte seulement
@@ -46,13 +56,37 @@ d'outil observé, « supposé » = non vérifié.
       magnétisme), adaptateur `mod_api` (`runtime.rs`, keybinds `pvp:<module>.<id>`).
       Constaté localement : 17 tests OK, clippy -D warnings OK. Pas encore vérifié en CI ni en jeu.
       Limite : l'échelle des éléments HUD est stockée mais pas rendue (pas de mise à l'échelle dans `DrawContext`).
-- [ ] 1.1 `pvp-client` (exécutable, `main_with`), 1.5 keybinds/Shift droit, 1.6 menu (UI OneConfig), 1.7 éditeur HUD
-- Prochaine étape : étudier OneConfig/PolyUI (UI à reproduire), écrire `pvp-client`, e2e horizon-ctl.
+- [~] 1.1 `pvp-client` : exécutable écrit (`registry::init(pvp_modules::ALL)` puis
+      `main_with(vec![pvp_core::runtime::entry(), pvp_ui::entry()])`, sans les parties en ligne d'Horizon :
+      heartbeat, serveur officiel, amis, Discord). Constaté : compile en local (debug).
+- [~] 1.6 socle de rendu `pvp-ui` : OneConfig actuel est en Jetpack Compose (PolyUI n'est plus utilisé). Constaté
+      dans l'API : textures dynamiques (`create_dynamic_texture`, 1024 px de côté max, 4 Mio par mod),
+      `mod_screen_open` (écran du mod, en jeu seulement), hooks souris/clavier d'écran, `gui_scale()`,
+      `render_frame_pre` (&mut host, avant le rendu). Donc police Poppins (OFL) rastérisée via ab_glyph et coins
+      arrondis rastérisés dans un atlas 1024×512 → reproduction fidèle sans toucher au moteur.
+      Écrit : `atlas.rs` (shelf packer, plein → vidé avant l'image suivante), `font.rs`, `shape.rs`, `icons.rs`
+      (33 SVG OneConfig via resvg), `gfx.rs` (Painter en unités dp, échelle et opacité), `theme.rs` (palette
+      Polyfrosted Dark exacte), `ctx.rs` (entrées, animations 150 ms FastOutSlowIn), `widgets.rs` (switch,
+      checkbox, slider + champ 87 dp, select, keybind, champ texte, recherche, boutons, puces, entrées de nav).
+      Spécification : `research/oneconfig/ui-spec.md` (déléguée, vérifiée par échantillon : palette `Impls.kt:81-98`,
+      fenêtre 1391×700 `OneConfigInterface.kt:217`, accent `ThemeConfig.java:51` — conformes).
+- [~] 1.5 Shift droit (`pvp_ui:menu`, `key.keyboard.right.shift`) → `mod_screen_open`. Écrit, non testé en jeu.
+- [~] 1.6 menu : shell OneConfig (fenêtre 1391×700 dp, ombre, barre latérale 264 dp, en-tête, recherche,
+      ouverture 600 ms ease-out-expo), page Mods (puces de catégorie, grille 4×255×140), page module (cartes
+      d'option et contrôle par type de réglage, popup select, sélecteur de couleur), Profils, Raccourcis.
+      Tests unitaires : 17 OK (pvp-ui). Non testé en jeu. Écarts connus : bordure en dégradé des cartes rendue
+      unie, pas de tête de joueur (pas d'API client du nom/skin), pas de transition de page (300 ms).
+- [~] 1.8 module témoin FPS (`pvp-modules`) : écrit, test unitaire OK.
+- [ ] 1.7 éditeur HUD ; e2e horizon-ctl — **bloqué : ressources du jeu non préparables** (voir Blocages).
 
 ### Phase 2 / 3 / 4
 Voir docs/ROADMAP.md ; détaillées ici au démarrage de chaque phase.
 
 ## Blocages et constats importants
+
+- 2026-11-26 : `horizon-prepare --prepare` refuse : `%APPDATA%\.minecraftersions.3.3.jar` absent (seul le
+  JSON existe ; index d'assets 34 et 40 bibliothèques manquent aussi). Action utilisateur : lancer Minecraft 26.3
+  une fois depuis le launcher officiel. Horizon ne télécharge pas le jeu lui-même (choix voulu).
 
 - 2026-11-25 ~19:45 UTC : organisation `horizon-rust` entièrement en 404 (constaté via API, git, web).
   Remote provisoire : `rdbtCVS/horizon` (indiqué par le Discord d'Horizon, tête `ae632edf48` constatée).
@@ -68,4 +102,5 @@ Voir docs/ROADMAP.md ; détaillées ici au démarrage de chaque phase.
 | Date | Tâche | Modèle | Résultat / corrections |
 |---|---|---|---|
 | 2026-11-25 | Inventaire Polyfrost lot A (30 dépôts HUD/PvP/visuel) | opencode-go/deepseek-v4-pro (high) | livré (`research/polyfrost/batch-A.md`, 627 l.) ; vérifié par échantillon (PolySprint, PolyCrosshair : conformes) ; aucune correction |
+| 2026-11-26 | Spécification visuelle OneConfig (`research/oneconfig/ui-spec.md`) | opencode-go/deepseek-v4.1-flash (high) | en cours (1er essai `opencode/` refusé : solde ; 2e sur v4-pro annulé à la demande de l'utilisateur) |
 | 2026-11-25 | Inventaire Polyfrost lot B (45 dépôts chat/Hypixel/perf/divers) | opencode-go/deepseek-v4-pro (high) | livré (`research/polyfrost/batch-B.md`, 749 l.) ; non revérifié ligne à ligne ; statuts fair-play reclassés par moi dans MODULES.md |
