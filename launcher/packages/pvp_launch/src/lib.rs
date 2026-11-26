@@ -201,6 +201,35 @@ impl Layout {
     }
 }
 
+impl Layout {
+    /// The client's command line for an account-free developer session: no session at all, so the game
+    /// plays single player only (online-mode servers refuse it). For development builds of the launcher
+    /// only (Horizon's own `--developer-single-player` rule); never offered in a release.
+    pub fn offline_command(&self) -> Command {
+        let mut cmd = Command::new(self.client());
+        cmd.current_dir(&self.instance)
+            .arg("--resources")
+            .arg(&self.prepared)
+            .arg("--game-dir")
+            .arg(&self.instance)
+            .arg("--home")
+            .arg(&self.instance);
+        cmd
+    }
+
+    /// Starts [`offline_command`](Self::offline_command).
+    pub fn launch_offline(&self) -> Result<Child, Error> {
+        self.check_installed()?;
+        std::fs::create_dir_all(&self.instance)?;
+        Ok(self
+            .offline_command()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?)
+    }
+}
+
 /// Where Mojang serves the server jar `horizon-prepare` needs once: the URL, SHA-1 and size the player's own
 /// version JSON (`<minecraft>/versions/26.3/26.3.json`) gives. The launcher downloads it for a signed-in owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,6 +378,18 @@ mod tests {
             prep.windows(2)
                 .any(|w| w[0] == "--server-jar" && w[1].ends_with("26.3.jar"))
         );
+    }
+
+    #[test]
+    fn an_offline_session_carries_no_session() {
+        let l = Layout::under(Path::new("root"));
+        let args: Vec<_> = l
+            .offline_command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a.starts_with("--session")));
+        assert!(args.contains(&"--resources".to_owned()));
     }
 
     #[test]

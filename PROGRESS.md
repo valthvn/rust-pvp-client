@@ -172,6 +172,11 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
   application … users are not permitted to consent », constaté par l'utilisateur le 26/11). Seule voie : D5.
 - [x] Profil de modules choisi depuis le launcher : liste déroulante à côté de « Play PvP Client » (`pvp_launch::profiles` :
       lister, actif, choisir ; même règle de nom que pvp-core ; 6 tests OK). Compile ; non vu à l'écran.
+- [x] Mode hors ligne de développement (demande de l'utilisateur, en attendant l'approbation Mojang) : bouton
+      « Offline (dev) » à l'onboarding et lancement sans session (solo uniquement, `Layout::launch_offline`), seulement
+      dans les builds debug (`debug_assertions`) et sur des ressources déjà préparées (`PVP_CLIENT_PREPARED`, rien
+      n'est téléchargé) ; jamais dans une release, comme le mode développeur d'Horizon. 7 tests `pvp_launch` OK.
+- Revue d'App ID Mojang : formulaire rempli dans le navigateur de T3 Code le 26/11, envoi par l'utilisateur.
 - [ ] Installateurs cargo-packager.
 - À noter pour la distribution : OneLauncher embarque aussi des clés Polyfrost (CurseForge, Discord) dans
   `oneclient_common/src/constants.rs`.

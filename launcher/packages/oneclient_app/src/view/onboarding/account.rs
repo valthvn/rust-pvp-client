@@ -2,7 +2,9 @@ use freya::prelude::*;
 use oneclient_auth::MinecraftAccount;
 
 use crate::components::{Avatar, Button, Icon, IconType, use_microsoft_login};
-use crate::hooks::{try_default_account, use_current_account};
+use crate::hooks::{
+    AddOfflineAccountKeys, try_default_account, use_add_offline_account, use_current_account,
+};
 use crate::i18n::t;
 use crate::routes::Route;
 use crate::theme::{colors, text_size};
@@ -17,6 +19,7 @@ impl Component for OnboardingAccount {
     fn render(&self) -> impl IntoElement {
         let account_query = use_current_account();
         let msa = use_microsoft_login();
+        let add_offline = use_add_offline_account();
 
         let account = try_default_account(&account_query);
         let has_account = account.is_some();
@@ -33,8 +36,29 @@ impl Component for OnboardingAccount {
                 Some(account) => account_preview(account).into_element(),
                 None => {
                     let start = msa.clone();
-                    sign_in_card(msa.pending, msa.error.clone(), move |_| start.start())
-                        .into_element()
+                    let card = sign_in_card(msa.pending, msa.error.clone(), move |_| start.start());
+                    // Development builds only: a local account, to test the launcher and the PvP client
+                    // (single player) before the Azure app is approved. Never compiled into a release.
+                    if cfg!(debug_assertions) {
+                        rect()
+                            .vertical()
+                            .spacing(8.)
+                            .child(card)
+                            .child(
+                                Button::new()
+                                    .ghost()
+                                    .medium()
+                                    .on_press(move |_| {
+                                        add_offline.mutate(AddOfflineAccountKeys {
+                                            username: "Developer".to_owned(),
+                                        })
+                                    })
+                                    .text("Offline (dev)"),
+                            )
+                            .into_element()
+                    } else {
+                        card.into_element()
+                    }
                 }
             })
             .into_element();

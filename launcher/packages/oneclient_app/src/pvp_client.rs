@@ -36,7 +36,36 @@ fn layout() -> Option<(Layout, bool)> {
     if let Some(bin) = &dev {
         layout.bin = bin.clone();
     }
+    if let Some(prepared) = std::env::var_os("PVP_CLIENT_PREPARED") {
+        layout.prepared = PathBuf::from(prepared);
+    }
     Some((layout, dev.is_some()))
+}
+
+/// Account-free developer play: only in a development build of the launcher (never a release), only with an
+/// offline account, and only on resources already prepared on this machine (nothing is downloaded). The
+/// client gets no session, so it plays single player only, as Horizon's own developer mode does.
+fn run_developer_offline() -> Result<(), String> {
+    let (layout, _) = layout().ok_or("no launcher data folder")?;
+    layout.check_installed().map_err(|e| e.to_string())?;
+    let prepared = layout
+        .check_command()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !prepared {
+        return Err(format!(
+            "offline developer play needs resources prepared already ({} is not); set PVP_CLIENT_PREPARED",
+            layout.prepared.display()
+        ));
+    }
+    let mut child = layout.launch_offline().map_err(|e| e.to_string())?;
+    tracing::warn!(target: "pvp_client", "started the PvP client offline (developer build, single player only)");
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 async fn get(state: &LauncherState, url: &str) -> Result<Vec<u8>, String> {
@@ -171,6 +200,9 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("{e:#}"))?
         .ok_or_else(|| pvp_launch::Error::NotSignedIn.to_string())?;
+    if cfg!(debug_assertions) && account.kind == oneclient_auth::AccountKind::Offline {
+        return run_developer_offline();
+    }
     let session = Session::for_account(&account).map_err(|e| e.to_string())?;
     let (layout, dev) = layout().ok_or("no launcher data folder")?;
     if !dev {
