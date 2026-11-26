@@ -105,7 +105,23 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
 - Restes : traductions des clés `pvp.*` (repli lisible en attendant), tête du joueur, transitions de page,
   mise à l'échelle HUD.
 
-### Phase 2 / 3 / 4
+### Phase 2 (branche `phase2` ; `main` = e0b87d5, phase 1 fusionnée en avance rapide le 26/11 après e2e PASS)
+- [x] Événement souris `Events::MOUSE` dans `pvp-core` (hook `mouse_button_post`) pour le CPS.
+- [x] Lot 1, tous sur l'API de mods (aucune modification moteur) ; style de texte HUD partagé (`text.rs`) :
+      Ping, Coordonnées (+ direction), Horloge, Keystrokes + CPS, Armure (durabilité), Effets, Toggle Sprint/Sneak
+      (touche R, tient le mapping vanilla), Crosshair (croix/T/point, contour, cache le calque vanilla), Hitbox
+      (boîtes + regard, `render_level_stage`), Name tags (le sien en 3e personne, masquer joueurs/autres), Zoom (C).
+      Constaté en jeu le 26/11 (profil tout activé, `.local/p2-game/shots/`) : tous s'affichent ; armure et
+      effets après `/item replace` et `/effect give` ; R → « [Sprinting (Toggled)] » ; hitbox visible en F5.
+      Tests unitaires 12 OK, clippy -D warnings OK.
+      Écarts : nametag du joueur local non observé en F5 (le jeu ne consulte peut-être pas le hook pour lui) ;
+      la hitbox suit la position du tick (pas d'interpolation exposée) ; crosshair : l'indicateur d'attaque
+      vanilla disparaît avec le calque ; libellés de keystrokes fixes (W A S D, QWERTY).
+- [ ] Glint, heure/météo, damage tint, flou de menu : réglages internes d'Horizon (`horizon-client-render/src/pvp.rs`,
+      `Tweaks`) sans API de mods → petit hook moteur à ajouter.
+- [ ] e2e par module, bench tout activé / tout désactivé.
+
+### Phase 3 / 4
 Voir docs/ROADMAP.md ; détaillées ici au démarrage de chaque phase.
 
 ## Blocages et constats importants

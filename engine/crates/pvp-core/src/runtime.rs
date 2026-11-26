@@ -7,7 +7,8 @@ use crate::registry::{self, Registry};
 use mod_api::{
     ClientHost, ClientStoppingEvent, ClientTickPreEvent, ComputeFovModifierEvent, Flow,
     GuiLayerPreEvent, GuiRenderPostEvent, Hooks, InputKeyEvent, KeyRegistration, ModEntry,
-    Registrar, RegistrationContext, RenderLevelStageEvent, RenderNameTagEvent,
+    MouseButtonPostEvent, Registrar, RegistrationContext, RenderLevelStageEvent,
+    RenderNameTagEvent,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,6 +158,14 @@ impl Hooks for Runtime {
     fn input_key(&self, host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
         let Some(reg) = Self::reg() else { return };
         reg.each(Events::KEY, |m, cx| m.key(cx, &mut *host, event));
+    }
+
+    fn mouse_button_post(&self, host: &mut dyn ClientHost, event: &mut MouseButtonPostEvent) {
+        let Some(reg) = Self::reg() else { return };
+        let (button, pressed) = (event.button, event.pressed);
+        reg.each(Events::MOUSE, |m, cx| {
+            m.mouse(cx, &mut *host, button, pressed)
+        });
     }
 
     fn gui_layer_pre(&self, host: &dyn ClientHost, event: &mut GuiLayerPreEvent<'_>) -> Flow {

@@ -61,8 +61,10 @@ impl Events {
     pub const HUD: Events = Events(1 << 6);
     /// Its keybinds are polled each tick (implied by a non-empty `keybinds()`).
     pub const KEYBINDS: Events = Events(1 << 7);
+    /// `mouse`, each mouse button press and release while playing (after the game handled it).
+    pub const MOUSE: Events = Events(1 << 8);
 
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     pub const fn union(self, other: Events) -> Events {
         Events(self.0 | other.0)
@@ -172,6 +174,8 @@ pub trait Module: Sync + 'static {
 
     fn tick(&self, _cx: &Cx, _host: &mut dyn ClientHost) {}
     fn key(&self, _cx: &Cx, _host: &mut dyn ClientHost, _event: &InputKeyEvent<'_>) {}
+    /// Mouse button `button` (0 left, 1 right, 2 middle) was pressed or released.
+    fn mouse(&self, _cx: &Cx, _host: &mut dyn ClientHost, _button: i32, _pressed: bool) {}
     fn gui_layer(
         &self,
         _cx: &Cx,

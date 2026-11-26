@@ -9,6 +9,7 @@ description = "The PvP client's built-in modules (Polyfrost mod features, reimpl
 [dependencies]
 horizon-mod-api = { path = "../horizon-mod-api" }
 pvp-core = { path = "../pvp-core" }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [lints]
 workspace = true
