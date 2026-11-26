@@ -8,7 +8,7 @@ Client Minecraft: Java Edition 26.3 orienté PvP, **entièrement natif en Rust, 
   configurables depuis un menu in-game unique (Shift droit).
 - **Launcher** : dérivé de [OneLauncher / OneClient](https://github.com/Polyfrost/OneLauncher) (`launcher/`).
 
-État : en développement, dépôt privé. Voir [PROGRESS.md](PROGRESS.md).
+État : en développement, dépôt public depuis le 26/11/2026. Voir [PROGRESS.md](PROGRESS.md).
 
 ## Documentation
 

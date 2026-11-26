@@ -94,4 +94,4 @@ tout-activé / tout-désactivé, un commit par unité logique.
   figé et un miroir communautaire. Pas de bloquant immédiat ; la vélocité amont devient nulle.
 - **Coût de build en CI** : `horizon-client` est un très gros crate ; l'amont utilise des runners
   16 vCPU. Sur runners standard, un build froid peut dépasser 30-60 min (à mesurer en phase 0).
-- **Juridique** : la cause de la disparition de l'amont est inconnue. Le dépôt reste privé.
+- **Juridique** : la cause de la disparition de l'amont est inconnue. Le dépôt, d'abord privé, est public depuis le 26/11/2026 à la demande de l'utilisateur.

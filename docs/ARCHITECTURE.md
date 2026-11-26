@@ -307,7 +307,7 @@ Voir la décision ouverte D3 dans ROADMAP.md.
 ## 6. Organisation du dépôt et synchronisation amont
 
 ```
-/ (dépôt privé, GPL-3.0)
+/ (dépôt public, GPL-3.0)
 ├── README.md  LICENSE (GPL-3.0)  ATTRIBUTION.md  PROGRESS.md  .gitignore
 ├── docs/                 ARCHITECTURE.md, MODULES.md, ROADMAP.md, PERF.md
 ├── .github/workflows/    ci.yml, build.yml, e2e.yml, (release.yml)

@@ -1,9 +1,9 @@
 # PROGRESS
 
 Mémoire de travail du projet. À relire, avec `git log`, au début de chaque session.
-Règle : une tâche n'est cochée que si sa vérification est verte : `tools/ci-local.sh` (journal
-`engine/.local/ci/<commit>.log`, ligne `ci-local <commit>: PASS`), GitHub Actions étant indisponible (le compte
-ne paie pas ; décision utilisateur du 26/11). « constaté » = résultat d'outil observé, « supposé » = non vérifié.
+Règle : une tâche n'est cochée que si sa vérification est verte : le workflow GitHub Actions (lien ; gratuit depuis
+que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.local/ci/<commit>.log`) et
+`tools/e2e-local.sh` pour le jeu. « constaté » = résultat d'outil observé, « supposé » = non vérifié.
 
 ## État courant (2026-11-26)
 
@@ -19,7 +19,7 @@ ne paie pas ; décision utilisateur du 26/11). « constaté » = résultat d'out
 
 - Documents validés le 25/11 (D1-D4, D6 ; fair-play : toutes les fonctionnalités Polyfrost autorisées).
 - Nouvelle consigne : **reprendre à l'identique l'UI de OneClient/OneConfig** (menu, HUD, launcher).
-- Dépôt privé : https://github.com/valthvn/rust-pvp-client (subtrees `engine/` = Horizon ae632edf48,
+- Dépôt **public** depuis le 26/11 (demande de l'utilisateur) : https://github.com/valthvn/rust-pvp-client (subtrees `engine/` = Horizon ae632edf48,
   `launcher/` = OneLauncher 39f0cf3).
 - Phase 0 en cours (CI), phase 1 commencée (`pvp-core` écrit, testé localement).
 - Session arrêtée à la demande de l'utilisateur après ce lot.
@@ -38,7 +38,9 @@ ne paie pas ; décision utilisateur du 26/11). « constaté » = résultat d'out
 
 ### Phase 0 — Dépôt et CI
 - [x] Monorepo local (subtrees `engine/`, `launcher/`, remotes `upstream-horizon`, `upstream-onelauncher`) — constaté
-- [x] Dépôt GitHub privé, push — constaté (visibility PRIVATE)
+- [x] Dépôt GitHub, push — privé jusqu'au 26/11, puis **public** à la demande de l'utilisateur (constaté
+      `visibility PUBLIC`) ; historique audité avant : aucun fichier Mojang, ressource préparée ni secret (seule une
+      clé de test d'Horizon, déjà publique en amont), auteurs en adresses noreply.
 - [ ] ci.yml vert (Linux), puis matrice complète sur main
       - run 45702723724 (923c072) : engine macOS ✅, Windows ✅ ; engine Linux ❌ tué (exit 137, mémoire) pendant
         la compilation des tests ; launcher ❌ : `oneclient_db` (tests) utilise des `sqlx::query!` absents du cache
