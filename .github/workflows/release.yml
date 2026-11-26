@@ -2,8 +2,8 @@ name: release
 
 # A draft GitHub release of the client and the launcher, built with our own Microsoft app id. Run by hand
 # only (publishing is the maintainer's decision); the draft stays unpublished until someone publishes it.
-# Refuses to start without the PVP_MICROSOFT_CLIENT_ID secret: OneLauncher's (Polyfrost's) app id, which
-# development builds fall back to, is never distributed.
+# The launcher signs in with Ember Client's own Azure app id (built in; the PVP_MICROSOFT_CLIENT_ID secret
+# may override it). OneLauncher's (Polyfrost's) app id is refused.
 on:
   workflow_dispatch:
     inputs:
@@ -18,12 +18,12 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Our own Microsoft app id is set
+      - name: Not OneLauncher's app id
         env:
           ID: ${{ secrets.PVP_MICROSOFT_CLIENT_ID }}
         run: |
-          if [ -z "$ID" ] || [ "$ID" = "9419b7ee-1448-4d1b-b52a-550d8f36ab56" ]; then
-            echo "::error::Set the PVP_MICROSOFT_CLIENT_ID secret to our Mojang-approved Azure app id (decision D5)."
+          if [ "$ID" = "9419b7ee-1448-4d1b-b52a-550d8f36ab56" ]; then
+            echo "::error::PVP_MICROSOFT_CLIENT_ID is Polyfrost's app id; leave it unset (Ember Client's is built in)."
             exit 1
           fi
   build:

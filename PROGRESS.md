@@ -164,6 +164,10 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
       release publiée (publier est une décision de l'utilisateur).
 - [x] Progression de la préparation dans le launcher (barre « Preparing the PvP client », lignes `fraction`). Compile ;
       non vue à l'écran (derrière la connexion).
+- D5 (26/11) : app Azure « Ember Client » créée dans l'annuaire de l'utilisateur (comptes Microsoft personnels,
+  redirection `http://127.0.0.1` client public, flux publics activés), client ID `556ba9c8-1246-4728-8408-4a386a280a36`,
+  intégré au launcher. Reste : revue d'App ID par Mojang (démarche de l'utilisateur) ; avant elle, Minecraft refuse
+  les jetons. D7 : nom du client « Ember Client » (décision de l'utilisateur).
 - Connexion Microsoft : le client ID de Polyfrost est refusé par Microsoft pour notre build (« first party
   application … users are not permitted to consent », constaté par l'utilisateur le 26/11). Seule voie : D5.
 - [x] Profil de modules choisi depuis le launcher : liste déroulante à côté de « Play PvP Client » (`pvp_launch::profiles` :
