@@ -24,9 +24,67 @@ const BUILT: &[mod_api::__private::native::BuiltMod] = &[
     },
 ];
 
+/// Each built-in mod's package files, embedded: the mod host checks a manifest beside the executable
+/// (`horizon-native-mods/<id>`) for every mod linked in, so the executable writes them there when they are missing
+/// and works however it was copied.
+const PACKAGES: [(&str, [(&str, &str); 3]); 2] = [
+    (
+        pvp_core::runtime::MOD_ID,
+        [
+            (
+                "horizon-mod.toml",
+                include_str!("../native-mods/pvp/horizon-mod.toml"),
+            ),
+            ("Cargo.toml", include_str!("../native-mods/pvp/Cargo.toml")),
+            ("src/lib.rs", include_str!("../native-mods/pvp/src/lib.rs")),
+        ],
+    ),
+    (
+        pvp_ui::entry::MOD_ID,
+        [
+            (
+                "horizon-mod.toml",
+                include_str!("../native-mods/pvp_ui/horizon-mod.toml"),
+            ),
+            (
+                "Cargo.toml",
+                include_str!("../native-mods/pvp_ui/Cargo.toml"),
+            ),
+            (
+                "src/lib.rs",
+                include_str!("../native-mods/pvp_ui/src/lib.rs"),
+            ),
+        ],
+    ),
+];
+
+/// Writes the built-in mods' packages beside the executable where they are missing or differ.
+fn install_packages() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let root = exe.with_file_name("horizon-native-mods");
+    for (id, files) in PACKAGES {
+        for (name, text) in files {
+            let path = root.join(id).join(name);
+            if std::fs::read_to_string(&path).is_ok_and(|t| t == text) {
+                continue;
+            }
+            let written = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, text));
+            if let Err(e) = written {
+                eprintln!("pvp-client: cannot write {}: {e}", path.display());
+            }
+        }
+    }
+}
+
 fn main() {
     horizon_game::run_main(|| {
         std::hint::black_box(&GAME_IDENTITY);
+        install_packages();
         // The platform's menu look, as horizon_game::main gives it.
         horizon_game::give_menu_look();
         horizon_guest_stack::prepare_main();
