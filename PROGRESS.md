@@ -77,7 +77,11 @@ d'outil observé, « supposé » = non vérifié.
       Tests unitaires : 17 OK (pvp-ui). Non testé en jeu. Écarts connus : bordure en dégradé des cartes rendue
       unie, pas de tête de joueur (pas d'API client du nom/skin), pas de transition de page (300 ms).
 - [~] 1.8 module témoin FPS (`pvp-modules`) : écrit, test unitaire OK.
-- [ ] 1.7 éditeur HUD ; e2e horizon-ctl — **bloqué : ressources du jeu non préparables** (voir Blocages).
+- [~] 1.7 éditeur HUD (`pvp-ui/src/hud_editor.rs`, « Edit HUD » dans la barre latérale) : éléments des modules
+      actifs dessinés en place, contours OneConfig (blanc 0.2 / 0.5 survol / accent sélection), glisser avec
+      magnétisme 6 px (bords, marges 4 px, centres, autres éléments ; Alt désactive), guides accent 1 px, badge
+      « L × H ». Pas de redimensionnement : `DrawContext` n'a pas d'échelle (limite notée). Non testé en jeu.
+- [ ] e2e horizon-ctl — **bloqué : ressources du jeu non préparables** (voir Blocages).
 
 ### Phase 2 / 3 / 4
 Voir docs/ROADMAP.md ; détaillées ici au démarrage de chaque phase.

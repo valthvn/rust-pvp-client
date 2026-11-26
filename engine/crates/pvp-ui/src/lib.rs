@@ -8,6 +8,7 @@ pub mod ctx;
 pub mod entry;
 pub mod font;
 pub mod gfx;
+pub mod hud_editor;
 pub mod icons;
 pub mod menu;
 pub mod shape;

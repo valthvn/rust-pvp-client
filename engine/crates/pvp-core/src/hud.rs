@@ -117,8 +117,12 @@ pub enum Guide {
     Horizontal(f32),
 }
 
-/// Snaps a dragged rectangle `[x, y, w, h]` to the screen's edges and centre lines and to the edges and centres
-/// of `others`, within `threshold` GUI pixels on each axis. Returns the snapped top-left and the guides used.
+/// How far from each screen edge the padding snap lines are (OneConfig's `HudSnapping.kt:11`).
+pub const SCREEN_PADDING: f32 = 4.0;
+
+/// Snaps a dragged rectangle `[x, y, w, h]` to the screen's edges, its padding lines and centre lines, and to
+/// the edges and centres of `others`, within `threshold` GUI pixels on each axis. Returns the snapped top-left
+/// and the guides used.
 pub fn snap(
     rect: [f32; 4],
     others: &[[f32; 4]],
@@ -126,8 +130,9 @@ pub fn snap(
     threshold: f32,
 ) -> ([f32; 2], Vec<Guide>) {
     let [x, y, w, h] = rect;
-    let mut xs = vec![0.0, screen[0] / 2.0, screen[0]];
-    let mut ys = vec![0.0, screen[1] / 2.0, screen[1]];
+    let p = SCREEN_PADDING;
+    let mut xs = vec![0.0, p, screen[0] / 2.0, screen[0] - p, screen[0]];
+    let mut ys = vec![0.0, p, screen[1] / 2.0, screen[1] - p, screen[1]];
     for o in others {
         xs.extend([o[0], o[0] + o[2] / 2.0, o[0] + o[2]]);
         ys.extend([o[1], o[1] + o[3] / 2.0, o[1] + o[3]]);

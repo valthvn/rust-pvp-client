@@ -3,6 +3,7 @@
 
 use crate::ctx::Input;
 use crate::gfx::Ui;
+use crate::hud_editor::Editor;
 use crate::menu::Menu;
 use mod_api::{
     ClientHost, ClientTickPreEvent, Flow, Hooks, KeyRegistration, ModEntry, Registrar,
@@ -30,6 +31,9 @@ struct UiMod {
 struct State {
     ui: Ui,
     menu: Menu,
+    editor: Editor,
+    /// The screen shows the HUD editor instead of the menu.
+    editing: bool,
 }
 
 impl UiMod {
@@ -56,13 +60,23 @@ impl Hooks for UiMod {
         while host.consume_click(MOD_ID, MENU_KEY) {
             opened = true;
         }
+        let mut st = self.state();
+        // Our screen closed (Escape, another screen): leave the editor.
+        if st.editing && !ours(host) {
+            st.editing = false;
+            pvp_core::runtime::set_editing(false);
+        }
         if opened && host.mod_screen().is_none() && host.mod_screen_open(MOD_ID) {
-            let mut st = self.state();
-            let State { ui, menu } = &mut *st;
+            let State { ui, menu, .. } = &mut *st;
             menu.opened(ui);
         }
-        let close = self.state().menu.take_close();
-        if close {
+        if st.menu.take_edit_hud() {
+            st.editing = true;
+            st.editor.opened();
+            pvp_core::runtime::set_editing(true);
+        }
+        if st.menu.take_close() {
+            drop(st);
             host.mod_screen_close(MOD_ID);
         }
     }
@@ -77,8 +91,17 @@ impl Hooks for UiMod {
         }
         let mouse = event.screen.mouse;
         let mut st = self.state();
-        let State { ui, menu } = &mut *st;
-        menu.draw(ui, event.draw, host, mouse);
+        let State {
+            ui,
+            menu,
+            editor,
+            editing,
+        } = &mut *st;
+        if *editing {
+            editor.draw(ui, event.draw, host, mouse);
+        } else {
+            menu.draw(ui, event.draw, host, mouse);
+        }
     }
 
     fn screen_mouse_button_pressed_pre(
@@ -146,7 +169,12 @@ impl UiMod {
             return Flow::Continue;
         }
         let _ = mouse;
-        self.state().menu.input(input);
+        let mut st = self.state();
+        if st.editing {
+            st.editor.input(input);
+        } else {
+            st.menu.input(input);
+        }
         Flow::Cancel
     }
 }
