@@ -41,7 +41,8 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
 - [x] Dépôt GitHub, push — privé jusqu'au 26/11, puis **public** à la demande de l'utilisateur (constaté
       `visibility PUBLIC`) ; historique audité avant : aucun fichier Mojang, ressource préparée ni secret (seule une
       clé de test d'Horizon, déjà publique en amont), auteurs en adresses noreply.
-- [ ] ci.yml vert (Linux), puis matrice complète sur main
+- [x] ci.yml vert (Linux) sur `phase1` : https://github.com/valthvn/rust-pvp-client/actions/runs/45818522378
+      (engine : fmt, clippy -D warnings, tests du workspace ; launcher). Matrice complète : au merge sur main.
       - run 45702723724 (923c072) : engine macOS ✅, Windows ✅ ; engine Linux ❌ tué (exit 137, mémoire) pendant
         la compilation des tests ; launcher ❌ : `oneclient_db` (tests) utilise des `sqlx::query!` absents du cache
         hors ligne `.sqlx`. Correctif db48831 (branche phase1) : swap 12 Go + tests sans debuginfo, 3 jobs ;
@@ -51,9 +52,9 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
         engine Linux : en cours à l'arrêt de session ; launcher ❌ sur les 3 OS (OneLauncher amont non
         conforme à rustfmt stable / clippy -D warnings) → ci.yml corrigé : vérification stricte seulement
         sur nos crates du launcher, clippy amont en rapport seulement. À revérifier.
-- [ ] build.yml (artifacts) — run 45695282620 : les builds macOS client et launcher compilent, mais
-      **l'upload échoue : quota de stockage d'artifacts du compte GitHub atteint** (partagé entre dépôts
-      privés). Rétention réduite à 3 jours. Action utilisateur : libérer des artifacts ou augmenter le quota.
+- [x] build.yml : https://github.com/valthvn/rust-pvp-client/actions/runs/45818523221 — client et launcher release
+      sur Linux, Windows, macOS. Constaté : le client Windows de l'artifact démarre, écrit ses manifestes de mods
+      intégrés, Shift droit ouvre le menu ; 46 FPS (release, iGPU UHD 620, 2560×1440) contre 29 en debug.
 - [ ] e2e.yml (selon D4)
 - [ ] Benchmark de référence (docs/PERF.md)
 
