@@ -158,7 +158,14 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
       téléchargé chez Mojang et vérifié SHA-1, préparation si `--check` échoue, lancement). Compile ; lancé localement.
       Non vérifié : clic → connexion → partie (demande une connexion Microsoft par l'utilisateur).
 - [x] `release.yml` (à la main seulement, brouillon non publié) ; `build.yml` réutilisable (`workflow_call`).
-- [ ] Téléchargement du client depuis une release (aucune release publiée ; `PVP_CLIENT_BIN` en attendant).
+- [~] Installation et mise à jour du client depuis la dernière release publiée (API GitHub, archive
+      `client-<plateforme>.zip`, SHA-256 vérifié contre `SHA256SUMS`, décompressé à côté puis échangé ; hors ligne, le
+      client installé est gardé). Fonctions pures testées (5 tests `pvp_launch`) ; non testé de bout en bout : aucune
+      release publiée (publier est une décision de l'utilisateur).
+- [x] Progression de la préparation dans le launcher (barre « Preparing the PvP client », lignes `fraction`). Compile ;
+      non vue à l'écran (derrière la connexion).
+- Connexion Microsoft : le client ID de Polyfrost est refusé par Microsoft pour notre build (« first party
+  application … users are not permitted to consent », constaté par l'utilisateur le 26/11). Seule voie : D5.
 - [ ] Installateurs cargo-packager, mises à jour, profils de modules dans le launcher.
 - À noter pour la distribution : OneLauncher embarque aussi des clés Polyfrost (CurseForge, Discord) dans
   `oneclient_common/src/constants.rs`.

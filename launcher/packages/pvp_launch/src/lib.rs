@@ -225,6 +225,69 @@ pub fn server_jar_source(minecraft_dir: &Path) -> Result<ServerJar, Error> {
     }
 }
 
+/// The latest published release of the client (drafts are never listed).
+pub const LATEST_RELEASE: &str =
+    "https://api.github.com/repos/valthvn/rust-pvp-client/releases/latest";
+/// The file in [`Layout::bin`] naming the release installed there.
+pub const INSTALLED_TAG: &str = ".release-tag";
+
+/// This platform's client archive, as `release.yml` names it (`client-<platform>.zip`).
+pub fn asset_name() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Some("client-windows-x64.zip"),
+        ("linux", "x86_64") => Some("client-linux-x64.zip"),
+        ("macos", "aarch64") => Some("client-macos-arm64.zip"),
+        _ => None,
+    }
+}
+
+/// A release's archive for this platform and its checksum list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Release {
+    pub tag: String,
+    pub archive_url: String,
+    pub sums_url: String,
+}
+
+/// Reads GitHub's release JSON: the archive named `asset` and `SHA256SUMS`, both required.
+pub fn release_from_json(json: &str, asset: &str) -> Option<Release> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let url = |name: &str| {
+        v["assets"].as_array()?.iter().find_map(|a| {
+            (a["name"].as_str() == Some(name))
+                .then(|| a["browser_download_url"].as_str().map(str::to_owned))
+                .flatten()
+        })
+    };
+    Some(Release {
+        tag: v["tag_name"].as_str()?.to_owned(),
+        archive_url: url(asset)?,
+        sums_url: url("SHA256SUMS")?,
+    })
+}
+
+/// The SHA-256 `sha256sum` wrote for `file` in `sums`.
+pub fn sha256_for<'a>(sums: &'a str, file: &str) -> Option<&'a str> {
+    sums.lines().find_map(|l| {
+        let (hash, name) = l.split_once(char::is_whitespace)?;
+        (name.trim_start_matches([' ', '*']) == file).then_some(hash)
+    })
+}
+
+/// The release installed in `bin`, if any.
+pub fn installed_tag(bin: &Path) -> Option<String> {
+    std::fs::read_to_string(bin.join(INSTALLED_TAG))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// How far `horizon-prepare --progress json` is, from its `{"fraction": …}` lines.
+pub fn progress_fraction(line: &str) -> Option<f64> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v["fraction"].as_f64().map(|f| f.clamp(0.0, 1.0))
+}
+
 /// One line of `horizon-prepare --progress json`: what to show the player, if anything.
 pub fn progress_message(line: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -300,6 +363,23 @@ mod tests {
         assert_eq!(jar.sha1, "abc");
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(server_jar_source(&dir).is_err());
+    }
+
+    #[test]
+    fn releases_and_checksums() {
+        let json = r#"{"tag_name":"v0.1.0","assets":[
+            {"name":"client-windows-x64.zip","browser_download_url":"https://x/c.zip"},
+            {"name":"SHA256SUMS","browser_download_url":"https://x/sums"}]}"#;
+        let r = release_from_json(json, "client-windows-x64.zip").unwrap();
+        assert_eq!(r.tag, "v0.1.0");
+        assert_eq!(r.archive_url, "https://x/c.zip");
+        assert!(release_from_json(json, "client-linux-x64.zip").is_none());
+        let sums = "aa11  client-linux-x64.zip
+bb22  client-windows-x64.zip
+";
+        assert_eq!(sha256_for(sums, "client-windows-x64.zip"), Some("bb22"));
+        assert_eq!(sha256_for(sums, "other.zip"), None);
+        assert_eq!(progress_fraction(r#"{"fraction": 0.5}"#), Some(0.5));
     }
 
     #[test]
