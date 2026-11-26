@@ -253,11 +253,11 @@ impl Game<'_> {
     }
     /// The block outline, hurt overlay and glint colours the renderer draws with.
     pub(in crate::game) fn pvp_render_frame(&self) -> Frame {
-        self.settings.extras.pvp.frame()
+        horizon_client::pvp::overridden(self.settings.extras.pvp.frame())
     }
     /// The enchantment glint's colour texel, 0 for vanilla's.
     pub(in crate::game) fn pvp_glint_texel(&self) -> u32 {
-        self.settings.extras.pvp.tweaks.glint_texel()
+        self.pvp_render_frame().glint
     }
     /// The held shield's size in percent (100 is vanilla's).
     pub(in crate::game) fn pvp_shield_size(&self) -> u8 {

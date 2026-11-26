@@ -539,6 +539,21 @@ pub struct Frame {
     /// The glint's colour ([`Tweaks::glint_texel`]), 0 for vanilla's.
     pub glint: u32,
 }
+/// A replacement for [`Pvp::frame`] that the executable embedding the game may install once, at start (a
+/// client that ships its own outline, hurt and glint options): it gets the options' frame and returns the one
+/// drawn. With none installed, the options' frame is drawn.
+static FRAME_OVERRIDE: std::sync::OnceLock<fn(Frame) -> Frame> = std::sync::OnceLock::new();
+
+/// Installs the frame override; false when one already is.
+pub fn set_frame_override(f: fn(Frame) -> Frame) -> bool {
+    FRAME_OVERRIDE.set(f).is_ok()
+}
+
+/// `frame` as the installed override changes it.
+pub fn overridden(frame: Frame) -> Frame {
+    FRAME_OVERRIDE.get().map_or(frame, |f| f(frame))
+}
+
 impl Pvp {
     pub fn frame(&self) -> Frame {
         Frame {

@@ -120,8 +120,11 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
 - [~] Heure et météo côté client (`sky.rs`) via le hook `sky_environment` (`Events::SKY`). Tests unitaires OK ;
       non vérifié en jeu : le jeu ne pose la question que connecté à un serveur (en solo il dessine le monde qu'il
       fait tourner, choix d'Horizon testé par `sky_environment_tests`).
-- [ ] Glint, damage tint, flou de menu : réglages internes d'Horizon (`horizon-client-render/src/pvp.rs`,
-      `Tweaks`) sans API de mods → petit hook moteur à ajouter.
+- [x] Glint et Damage tint (`look.rs`). Pas d'API de mods pour ces couleurs → hook moteur minimal (fork, +17/-2 lignes) :
+      `horizon_client_render::pvp::set_frame_override` (une fonction installée une fois au démarrage par l'exécutable)
+      appliquée dans `pvp_render_frame` / `pvp_glint_texel` ; sans override, comportement inchangé. Constaté en jeu le
+      26/11 : épée enchantée à glint rouge ; vache frappée teintée en bleu à 70 % (`shots/cow-hurt.png`, `cow.png`).
+- [ ] Flou de menu.
 - [ ] e2e par module, bench tout activé / tout désactivé.
 
 ### Phase 3 / 4

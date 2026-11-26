@@ -5,7 +5,10 @@
 //! Unlike `horizon-official`, it registers none of Horizon's online parts (the "I'm playing" heartbeat, the
 //! official server entry, Play with Friends, Discord presence): this is not Horizon's official build, so it
 //! must not report itself to Horizon's services.
+
 #![forbid(unsafe_code)]
+
+mod look;
 
 /// The game identity marker for launcher imports, retained by `main`.
 static GAME_IDENTITY: [u8; horizon_game::GAME_IDENTITY.len()] = horizon_game::GAME_IDENTITY;
@@ -93,6 +96,7 @@ fn main() {
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         std::hint::black_box(&horizon_mod_package::holder::CAPABILITY);
         pvp_core::registry::init(pvp_modules::ALL);
+        look::install();
         horizon_mod_host::main_with(
             vec![pvp_core::runtime::entry(), pvp_ui::entry()],
             &[],
