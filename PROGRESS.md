@@ -84,7 +84,7 @@ Voir docs/ROADMAP.md ; détaillées ici au démarrage de chaque phase.
 
 ## Blocages et constats importants
 
-- 2026-11-26 : `horizon-prepare --prepare` refuse : `%APPDATA%\.minecraftersions.3.3.jar` absent (seul le
+- 2026-11-26 : `horizon-prepare --prepare` refuse : `%APPDATA%/.minecraft/versions/26.3/26.3.jar` absent (seul le
   JSON existe ; index d'assets 34 et 40 bibliothèques manquent aussi). Action utilisateur : lancer Minecraft 26.3
   une fois depuis le launcher officiel. Horizon ne télécharge pas le jeu lui-même (choix voulu).
 
