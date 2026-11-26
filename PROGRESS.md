@@ -117,7 +117,10 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
       Écarts : nametag du joueur local non observé en F5 (le jeu ne consulte peut-être pas le hook pour lui) ;
       la hitbox suit la position du tick (pas d'interpolation exposée) ; crosshair : l'indicateur d'attaque
       vanilla disparaît avec le calque ; libellés de keystrokes fixes (W A S D, QWERTY).
-- [ ] Glint, heure/météo, damage tint, flou de menu : réglages internes d'Horizon (`horizon-client-render/src/pvp.rs`,
+- [~] Heure et météo côté client (`sky.rs`) via le hook `sky_environment` (`Events::SKY`). Tests unitaires OK ;
+      non vérifié en jeu : le jeu ne pose la question que connecté à un serveur (en solo il dessine le monde qu'il
+      fait tourner, choix d'Horizon testé par `sky_environment_tests`).
+- [ ] Glint, damage tint, flou de menu : réglages internes d'Horizon (`horizon-client-render/src/pvp.rs`,
       `Tweaks`) sans API de mods → petit hook moteur à ajouter.
 - [ ] e2e par module, bench tout activé / tout désactivé.
 

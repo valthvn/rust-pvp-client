@@ -10,6 +10,7 @@ pub mod hitbox;
 pub mod info;
 pub mod keystrokes;
 pub mod nametags;
+pub mod sky;
 pub mod text;
 pub mod toggle_sprint;
 pub mod zoom;
@@ -30,4 +31,5 @@ pub static ALL: &[&dyn Module] = &[
     &hitbox::HITBOX,
     &nametags::NAMETAGS,
     &zoom::ZOOM,
+    &sky::SKY,
 ];

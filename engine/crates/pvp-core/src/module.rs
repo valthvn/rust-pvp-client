@@ -4,7 +4,7 @@ use crate::hud::HudPos;
 use crate::setting::{Setting, Value};
 use mod_api::{
     ClientHost, ComputeFovModifierEvent, DrawContext, Flow, GuiLayerPreEvent, InputKeyEvent,
-    RenderLevelStageEvent, RenderNameTagEvent,
+    RenderLevelStageEvent, RenderNameTagEvent, SkyEnvironmentEvent,
 };
 
 /// The menu's categories.
@@ -63,8 +63,10 @@ impl Events {
     pub const KEYBINDS: Events = Events(1 << 7);
     /// `mouse`, each mouse button press and release while playing (after the game handled it).
     pub const MOUSE: Events = Events(1 << 8);
+    /// `sky`, the time of day and weather this client draws (asked only when connected to a server).
+    pub const SKY: Events = Events(1 << 9);
 
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
 
     pub const fn union(self, other: Events) -> Events {
         Events(self.0 | other.0)
@@ -193,4 +195,5 @@ pub trait Module: Sync + 'static {
     ) {
     }
     fn fov(&self, _cx: &Cx, _host: &dyn ClientHost, _event: &mut ComputeFovModifierEvent<'_>) {}
+    fn sky(&self, _cx: &Cx, _host: &dyn ClientHost, _event: &mut SkyEnvironmentEvent) {}
 }

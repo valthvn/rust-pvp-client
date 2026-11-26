@@ -8,7 +8,7 @@ use mod_api::{
     ClientHost, ClientStoppingEvent, ClientTickPreEvent, ComputeFovModifierEvent, Flow,
     GuiLayerPreEvent, GuiRenderPostEvent, Hooks, InputKeyEvent, KeyRegistration, ModEntry,
     MouseButtonPostEvent, Registrar, RegistrationContext, RenderLevelStageEvent,
-    RenderNameTagEvent,
+    RenderNameTagEvent, SkyEnvironmentEvent,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -217,6 +217,11 @@ impl Hooks for Runtime {
     fn compute_fov_modifier(&self, host: &dyn ClientHost, event: &mut ComputeFovModifierEvent<'_>) {
         let Some(reg) = Self::reg() else { return };
         reg.each(Events::FOV, |m, cx| m.fov(cx, host, event));
+    }
+
+    fn sky_environment(&self, host: &dyn ClientHost, event: &mut SkyEnvironmentEvent) {
+        let Some(reg) = Self::reg() else { return };
+        reg.each(Events::SKY, |m, cx| m.sky(cx, host, event));
     }
 
     fn client_stopping(&self, _: &mut dyn ClientHost, _: &mut ClientStoppingEvent) {
