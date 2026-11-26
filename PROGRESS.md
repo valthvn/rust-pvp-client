@@ -1,14 +1,20 @@
 # PROGRESS
 
 Mémoire de travail du projet. À relire, avec `git log`, au début de chaque session.
-Règle : une tâche n'est cochée que si son workflow CI est vert (lien) ; « constaté » = résultat
-d'outil observé, « supposé » = non vérifié.
+Règle : une tâche n'est cochée que si sa vérification est verte : `tools/ci-local.sh` (journal
+`engine/.local/ci/<commit>.log`, ligne `ci-local <commit>: PASS`), GitHub Actions étant indisponible (le compte
+ne paie pas ; décision utilisateur du 26/11). « constaté » = résultat d'outil observé, « supposé » = non vérifié.
 
 ## État courant (2026-11-26)
 
-- **Bloquant (action utilisateur) : GitHub Actions ne démarre plus aucun job** — annotation constatée sur le
-  run 45764065757 (branche `phase1`) : « recent account payments have failed or your spending limit needs to be
-  increased ». À régler dans Billing & plans du compte. En attendant : travail et tests en local, CI à rejouer.
+- GitHub Actions ne démarre plus de job (run 45764065757 : « recent account payments have failed or your spending
+  limit needs to be increased ») et l'utilisateur ne paiera pas. Remplacé par `tools/ci-local.sh` (fmt, clippy
+  -D warnings, tests de nos crates `pvp-*`, build du client ; 2 jobs pour tenir dans 8 Go). Première passe :
+  `ci-local 6382b21+dirty: PASS` (fmt 3 s, clippy 49 s, tests 679 s, build 138 s). Le code Horizon n'est pas
+  re-testé localement : nous ne le modifions pas.
+- Fichiers 26.3 : téléchargés le 26/11 depuis les serveurs Mojang d'après le `26.3.json` du launcher officiel
+  (5 263 fichiers vérifiés SHA-1, 248 Mio) à la demande de l'utilisateur ; ressources préparées
+  (`horizon-prepare --prepare --complete`, 191 s) dans `engine/.local/horizon-client/26.3`.
 - Travail en cours sur la branche `phase1` (main inchangé depuis 923c072).
 
 - Documents validés le 25/11 (D1-D4, D6 ; fair-play : toutes les fonctionnalités Polyfrost autorisées).
@@ -81,16 +87,14 @@ d'outil observé, « supposé » = non vérifié.
       actifs dessinés en place, contours OneConfig (blanc 0.2 / 0.5 survol / accent sélection), glisser avec
       magnétisme 6 px (bords, marges 4 px, centres, autres éléments ; Alt désactive), guides accent 1 px, badge
       « L × H ». Pas de redimensionnement : `DrawContext` n'a pas d'échelle (limite notée). Non testé en jeu.
-- [ ] e2e horizon-ctl — **bloqué : ressources du jeu non préparables** (voir Blocages).
+- [ ] e2e horizon-ctl — ressources prêtes, en cours.
 
 ### Phase 2 / 3 / 4
 Voir docs/ROADMAP.md ; détaillées ici au démarrage de chaque phase.
 
 ## Blocages et constats importants
 
-- 2026-11-26 : `horizon-prepare --prepare` refuse : `%APPDATA%/.minecraft/versions/26.3/26.3.jar` absent (seul le
-  JSON existe ; index d'assets 34 et 40 bibliothèques manquent aussi). Action utilisateur : lancer Minecraft 26.3
-  une fois depuis le launcher officiel. Horizon ne télécharge pas le jeu lui-même (choix voulu).
+- 2026-11-26 : `26.3.jar` absent de `.minecraft` (seul le JSON) → résolu le jour même (voir État courant).
 
 - 2026-11-25 ~19:45 UTC : organisation `horizon-rust` entièrement en 404 (constaté via API, git, web).
   Remote provisoire : `rdbtCVS/horizon` (indiqué par le Discord d'Horizon, tête `ae632edf48` constatée).
