@@ -31,6 +31,8 @@ pub struct Ui {
     /// The window's size in physical pixels, as last read.
     pub window: [f32; 2],
     created: bool,
+    /// Sprites the game refused to draw (logged once a second while any are).
+    refused: u32,
     start: Instant,
     /// Seconds since the UI started, read once per frame.
     pub now: f32,
@@ -46,6 +48,7 @@ impl Default for Ui {
             gui_scale: 2.0,
             window: [1920.0, 1080.0],
             created: false,
+            refused: 0,
             start: Instant::now(),
             now: 0.0,
         }
@@ -56,8 +59,26 @@ impl Ui {
     /// Once a frame before drawing (`render_frame_pre`): reads the GUI scale and sends the atlas's new pixels.
     /// A scale change, or an atlas that filled up last frame, clears it: what is drawn next is rasterized again.
     pub fn sync(&mut self, host: &mut dyn ClientHost) {
-        self.now = self.start.elapsed().as_secs_f32();
+        let now = self.start.elapsed().as_secs_f32();
+        if self.refused > 0 && now.floor() != self.now.floor() {
+            log::warn!(
+                "pvp: {} UI sprite draws refused (created: {})",
+                self.refused,
+                self.created
+            );
+            self.refused = 0;
+        }
+        self.now = now;
         let scale = host.gui_scale().unwrap_or(2).max(1) as f32;
+        if debug() && (scale != self.gui_scale || self.atlas.full) {
+            log::info!(
+                "pvp: clearing the UI atlas (scale {} -> {scale}, full {}, refused {:?}, shelves used {})",
+                self.gui_scale,
+                self.atlas.full,
+                self.atlas.refused,
+                self.atlas.used_height()
+            );
+        }
         if scale != self.gui_scale || self.atlas.full {
             self.gui_scale = scale;
             self.atlas.clear();
@@ -76,6 +97,12 @@ impl Ui {
         };
         match result {
             Ok(()) => {
+                if !self.created {
+                    log::info!("pvp: UI atlas {ATLAS_ID} created ({w}x{h})");
+                } else if debug() {
+                    let ink = px.chunks(4).filter(|p| p[3] > 0).count();
+                    log::info!("pvp: UI atlas updated, {ink} inked texels");
+                }
                 self.created = true;
                 self.atlas.dirty = false;
             }
@@ -255,7 +282,9 @@ impl Painter<'_> {
     fn emit(&mut self, p: shape::Pieces, c: u32) {
         for (src, dst) in p.corners {
             let g = self.gui(dst);
-            self.draw.sprite(ATLAS_ID, src, g, Some(c));
+            if !self.draw.sprite(ATLAS_ID, src, g, Some(c)) {
+                self.ui.refused += 1;
+            }
         }
         for f in p.fills {
             let g = self.gui(f);
@@ -275,7 +304,9 @@ impl Painter<'_> {
             .layout(&mut self.ui.atlas, text, style, at, self.phys);
         for q in quads {
             let g = self.gui(q.dst);
-            self.draw.sprite(ATLAS_ID, q.src, g, Some(c));
+            if !self.draw.sprite(ATLAS_ID, q.src, g, Some(c)) {
+                self.ui.refused += 1;
+            }
         }
     }
 
@@ -311,7 +342,9 @@ impl Painter<'_> {
         let px = (rect[2] * self.phys).round() as u32;
         if let Some(slot) = self.ui.icons.get(&mut self.ui.atlas, name, px) {
             let g = self.gui(rect);
-            self.draw.sprite(ATLAS_ID, slot.src(), g, Some(c));
+            if !self.draw.sprite(ATLAS_ID, slot.src(), g, Some(c)) {
+                self.ui.refused += 1;
+            }
         }
     }
 
@@ -323,4 +356,10 @@ impl Painter<'_> {
     pub fn pop_clip(&mut self) {
         let _ = self.draw.pop_clip();
     }
+}
+
+/// `PVP_UI_DEBUG=1`: log atlas uploads and draw the atlas itself over the menu.
+pub fn debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PVP_UI_DEBUG").is_some_and(|v| v == "1"))
 }

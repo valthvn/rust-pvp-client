@@ -10,6 +10,20 @@
 /// The game identity marker for launcher imports, retained by `main`.
 static GAME_IDENTITY: [u8; horizon_game::GAME_IDENTITY.len()] = horizon_game::GAME_IDENTITY;
 
+/// The mods linked in, as their manifests beside the executable declare them (`native-mods/`, `build.rs`).
+const BUILT: &[mod_api::__private::native::BuiltMod] = &[
+    mod_api::__private::native::BuiltMod {
+        id: pvp_core::runtime::MOD_ID,
+        version: "0.1.0",
+        side: mod_api::Side::Client,
+    },
+    mod_api::__private::native::BuiltMod {
+        id: pvp_ui::entry::MOD_ID,
+        version: "0.1.0",
+        side: mod_api::Side::Client,
+    },
+];
+
 fn main() {
     horizon_game::run_main(|| {
         std::hint::black_box(&GAME_IDENTITY);
@@ -24,7 +38,7 @@ fn main() {
         horizon_mod_host::main_with(
             vec![pvp_core::runtime::entry(), pvp_ui::entry()],
             &[],
-            &[],
+            BUILT,
             startup,
         );
     });

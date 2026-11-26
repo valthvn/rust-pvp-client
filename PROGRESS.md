@@ -76,7 +76,7 @@ ne paie pas ; décision utilisateur du 26/11). « constaté » = résultat d'out
       checkbox, slider + champ 87 dp, select, keybind, champ texte, recherche, boutons, puces, entrées de nav).
       Spécification : `research/oneconfig/ui-spec.md` (déléguée, vérifiée par échantillon : palette `Impls.kt:81-98`,
       fenêtre 1391×700 `OneConfigInterface.kt:217`, accent `ThemeConfig.java:51` — conformes).
-- [~] 1.5 Shift droit (`pvp_ui:menu`, `key.keyboard.right.shift`) → `mod_screen_open`. Écrit, non testé en jeu.
+- [x] 1.5 Shift droit (`pvp_ui:menu`, `key.keyboard.right.shift`) → `mod_screen_open` — e2e PASS.
 - [~] 1.6 menu : shell OneConfig (fenêtre 1391×700 dp, ombre, barre latérale 264 dp, en-tête, recherche,
       ouverture 600 ms ease-out-expo), page Mods (puces de catégorie, grille 4×255×140), page module (cartes
       d'option et contrôle par type de réglage, popup select, sélecteur de couleur), Profils, Raccourcis.
@@ -87,7 +87,20 @@ ne paie pas ; décision utilisateur du 26/11). « constaté » = résultat d'out
       actifs dessinés en place, contours OneConfig (blanc 0.2 / 0.5 survol / accent sélection), glisser avec
       magnétisme 6 px (bords, marges 4 px, centres, autres éléments ; Alt désactive), guides accent 1 px, badge
       « L × H ». Pas de redimensionnement : `DrawContext` n'a pas d'échelle (limite notée). Non testé en jeu.
-- [ ] e2e horizon-ctl — ressources prêtes, en cours.
+- [x] e2e en jeu (`tools/e2e-local.sh`, horizon-ctl, dossier de jeu `engine/.local/e2e-game`) :
+      `e2e-local 3b388fb(+modifs): PASS` le 26/11 — monde chargé ; Shift droit ouvre le menu (`screen mod`) ; le
+      pied de la carte FPS active le module ; la carte ouvre sa page ; Edit HUD ; glisser déplace l'élément ;
+      le profil sur disque a `enabled = true` et la nouvelle position. Captures dans `.local/e2e-game/shots/`.
+      Constaté en jeu : texte Poppins, icônes, coins arrondis, palette OneConfig ; 28-37 FPS (build debug, iGPU
+      Intel UHD 620, échelle GUI 6, 2560×1440).
+      Correctifs trouvés en jeu : pile du thread principal (build.rs, `/STACK`), manifestes des mods intégrés
+      (`horizon-native-mods/`), `blur_behind` floutait le menu, atlas saturé (étagères par paliers de 8 px,
+      rastérisation à l'échelle finale pendant l'ouverture, un seul rayon pour l'ombre), glisser rapide de
+      l'éditeur (événements traités dans l'ordre, avec leur position).
+- Changement moteur (fork) : `horizon-client/src/game/runtime/control.rs` +1 ligne, touche `rshift` du socket de
+  contrôle (outil de test, remontable en amont).
+- Restes : traductions des clés `pvp.*` (repli lisible en attendant), tête du joueur, transitions de page,
+  mise à l'échelle HUD.
 
 ### Phase 2 / 3 / 4
 Voir docs/ROADMAP.md ; détaillées ici au démarrage de chaque phase.

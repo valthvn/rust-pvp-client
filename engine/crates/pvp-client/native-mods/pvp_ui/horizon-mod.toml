@@ -1,0 +1,12 @@
+# The manifest the mod host checks for a mod linked into the executable (horizon_mod_host::main_with):
+# copied beside pvp-client as horizon-native-mods/pvp_ui by build.rs. Its code is built in, not here.
+id = 'pvp_ui'
+name = 'pvp_ui'
+version = '0.1.0'
+api = '0.2'
+side = 'client'
+capabilities = ['registries']
+[native]
+game = '26.3'
+horizon = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+mixins = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'

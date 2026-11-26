@@ -168,10 +168,9 @@ impl UiMod {
         if !ours(host) {
             return Flow::Continue;
         }
-        let _ = mouse;
         let mut st = self.state();
         if st.editing {
-            st.editor.input(input);
+            st.editor.input(input, mouse);
         } else {
             st.menu.input(input);
         }

@@ -4761,6 +4761,7 @@ dependencies = [
  "horizon-client",
  "horizon-game",
  "horizon-guest-stack",
+ "horizon-mod-api",
  "horizon-mod-host",
  "horizon-mod-package",
  "pvp-core",

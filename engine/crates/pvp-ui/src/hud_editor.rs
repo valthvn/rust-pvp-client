@@ -4,7 +4,7 @@
 //! Scaling is not offered: the game's GUI drawing has no scale (`DrawContext`), so a HUD element can only be
 //! drawn at its own size (`pvp_core::HudPos::scale` is kept in profiles for when it can).
 
-use crate::ctx::{Frame, Input};
+use crate::ctx::Input;
 use crate::font::{Style, Weight};
 use crate::gfx::Ui;
 use crate::theme::{self as t, with_alpha};
@@ -20,8 +20,8 @@ const BADGE_TEXT: Style = Style::new(Weight::Medium, 10.0);
 
 #[derive(Default)]
 pub struct Editor {
-    queue: Vec<Input>,
-    frame: Frame,
+    /// Input since the last frame, each with where the mouse was.
+    events: Vec<(Input, [f32; 2])>,
     selected: Option<(usize, usize)>,
     /// The dragged element and where the mouse holds it (from its top left).
     drag: Option<((usize, usize), [f32; 2])>,
@@ -37,17 +37,17 @@ struct Item {
 }
 
 impl Editor {
-    pub fn input(&mut self, input: Input) {
+    pub fn input(&mut self, input: Input, at: [f32; 2]) {
         if let Input::Key(k, _) = &input
             && (k == "key.keyboard.left.alt" || k == "key.keyboard.right.alt")
         {
             self.free = true;
         }
-        self.queue.push(input);
+        self.events.push((input, at));
     }
 
     pub fn opened(&mut self) {
-        self.queue.clear();
+        self.events.clear();
         self.selected = None;
         self.drag = None;
         self.guides.clear();
@@ -83,54 +83,34 @@ impl Editor {
     ) {
         let Some(reg) = registry::get() else { return };
         let screen = draw.size();
-        let dt = 0.016;
-        self.frame.begin(&mut self.queue, mouse, dt);
         let mut items = Self::items(reg, host, &*draw);
-        // Input: a press picks the topmost element under the mouse; a held drag moves it, snapped.
-        if self.frame.press {
-            self.frame.press = false;
-            self.selected = None;
-            self.free = false;
-            if let Some(it) = items
-                .iter()
-                .rev()
-                .find(|it| crate::ctx::inside(it.rect, mouse))
-            {
-                self.selected = Some(it.key);
-                self.drag = Some((it.key, [mouse[0] - it.rect[0], mouse[1] - it.rect[1]]));
+        // Input, in the order it came, each event where the mouse was then: a fast drag (several events
+        // between two frames) moves the element as far as a slow one.
+        for (input, at) in std::mem::take(&mut self.events) {
+            match input {
+                Input::Press(0) => {
+                    self.selected = None;
+                    self.free = false;
+                    if let Some(it) = items
+                        .iter()
+                        .rev()
+                        .find(|it| crate::ctx::inside(it.rect, at))
+                    {
+                        self.selected = Some(it.key);
+                        self.drag = Some((it.key, [at[0] - it.rect[0], at[1] - it.rect[1]]));
+                    }
+                }
+                Input::Drag(0, _) => self.move_to(reg, &mut items, at, screen),
+                Input::Release(0) => {
+                    self.move_to(reg, &mut items, at, screen);
+                    self.drag = None;
+                    self.guides.clear();
+                }
+                _ => {}
             }
         }
-        if !self.frame.down {
-            self.drag = None;
-            self.guides.clear();
-        }
-        if let Some((key, grab)) = self.drag
-            && let Some(idx) = items.iter().position(|it| it.key == key)
-        {
-            let r = items[idx].rect;
-            let wanted = [mouse[0] - grab[0], mouse[1] - grab[1], r[2], r[3]];
-            let others: Vec<[f32; 4]> = items
-                .iter()
-                .filter(|it| it.key != key)
-                .map(|it| it.rect)
-                .collect();
-            let (tl, guides) = if self.free {
-                ([wanted[0], wanted[1]], Vec::new())
-            } else {
-                hud::snap(wanted, &others, screen, SNAP)
-            };
-            let tl = [
-                tl[0].clamp(0.0, (screen[0] - r[2]).max(0.0)),
-                tl[1].clamp(0.0, (screen[1] - r[3]).max(0.0)),
-            ];
-            self.guides = guides;
-            let scale = reg.hud_pos(key.0, key.1).scale;
-            reg.set_hud_pos(
-                key.0,
-                key.1,
-                HudPos::from_top_left(tl, [r[2], r[3]], screen, scale),
-            );
-            items[idx].rect = [tl[0], tl[1], r[2], r[3]];
+        if self.drag.is_some() {
+            self.move_to(reg, &mut items, mouse, screen);
         }
         // The elements themselves, as the HUD draws them.
         for it in &items {
@@ -185,6 +165,37 @@ impl Editor {
         let r = [(screen[0] - w) / 2.0, 6.0, w, 18.0];
         p.rounded(r, 6.0, with_alpha(t::POPUP, 0.9));
         p.text_mid(hint, r[0] + 8.0, r[1], r[3], st, t::TEXT);
-        self.frame.end();
+    }
+
+    /// Moves the dragged element so the mouse at `at` holds it where it was grabbed, snapped.
+    fn move_to(&mut self, reg: &Registry, items: &mut [Item], at: [f32; 2], screen: [f32; 2]) {
+        let Some((key, grab)) = self.drag else { return };
+        let Some(idx) = items.iter().position(|it| it.key == key) else {
+            return;
+        };
+        let r = items[idx].rect;
+        let wanted = [at[0] - grab[0], at[1] - grab[1], r[2], r[3]];
+        let others: Vec<[f32; 4]> = items
+            .iter()
+            .filter(|it| it.key != key)
+            .map(|it| it.rect)
+            .collect();
+        let (tl, guides) = if self.free {
+            ([wanted[0], wanted[1]], Vec::new())
+        } else {
+            hud::snap(wanted, &others, screen, SNAP)
+        };
+        let tl = [
+            tl[0].clamp(0.0, (screen[0] - r[2]).max(0.0)),
+            tl[1].clamp(0.0, (screen[1] - r[3]).max(0.0)),
+        ];
+        self.guides = guides;
+        let scale = reg.hud_pos(key.0, key.1).scale;
+        reg.set_hud_pos(
+            key.0,
+            key.1,
+            HudPos::from_top_left(tl, [r[2], r[3]], screen, scale),
+        );
+        items[idx].rect = [tl[0], tl[1], r[2], r[3]];
     }
 }

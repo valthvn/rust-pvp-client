@@ -68,6 +68,8 @@ jobs:
         run: |
           mkdir -p ../dist
           cp "target/release/$BIN${{ matrix.exe }}" "../dist/pvp-client${{ matrix.exe }}"
+          # The manifests of the mods built into pvp-client, which the mod host reads beside it.
+          if [ -d target/release/horizon-native-mods ]; then cp -r target/release/horizon-native-mods ../dist/; fi
           cp "target/release/horizon-prepare${{ matrix.exe }}" ../dist/
           cp "target/release/horizon-ctl${{ matrix.exe }}" ../dist/
           cp research-lock.json ../dist/

@@ -175,7 +175,10 @@ impl Menu {
         let gui = draw.size();
         let window = [gui[0] * ui.gui_scale, gui[1] * ui.gui_scale];
         let open = ease_out_expo(((ui.now - self.opened_at) / 0.6).clamp(0.0, 1.0));
-        let phys = Self::scale_for(window) * (0.9 + 0.1 * open);
+        // Text, corners and icons are rasterized at the final scale; the opening zoom only scales the drawing,
+        // so it doesn't rasterize every size it passes through.
+        let target = Self::scale_for(window);
+        let phys = target * (0.9 + 0.1 * open);
         let k = phys / ui.gui_scale;
         let origin = [
             (gui[0] - t::WINDOW_W * k) / 2.0,
@@ -184,8 +187,8 @@ impl Menu {
         let dt = ui.now - self.last;
         self.last = ui.now;
         self.record_keys(reg);
-        draw.blur_behind();
-        let mut p = ui.painter_scaled(draw, phys, origin);
+        let mut p = ui.painter_scaled(draw, target, origin);
+        p.k = k;
         p.opacity = open;
         let mouse = p.to_units(mouse);
         let mut frame = std::mem::take(&mut self.frame);
@@ -221,6 +224,18 @@ impl Menu {
         if w.f.press && self.focus.is_some() {
             // A click on nothing ends typing.
             self.focus = None;
+        }
+        if crate::gfx::debug() {
+            let ok = w.p.draw.sprite(
+                crate::gfx::ATLAS_ID,
+                [0.0, 0.0, 1024.0, 512.0],
+                [0.0, 0.0, 256.0, 128.0],
+                None,
+            );
+            w.p.draw.fill(
+                [0.0, 128.0, 256.0, 2.0],
+                if ok { 0xFF00_FF00 } else { 0xFFFF_0000 },
+            );
         }
         frame.end();
         self.frame = frame;
@@ -276,7 +291,7 @@ fn shell(m: &mut Menu, w: &mut W<'_, '_>, reg: &Registry, host: &dyn ClientHost)
                 t::WINDOW_W + 2.0 * g,
                 t::WINDOW_H + 2.0 * g,
             ],
-            t::R_WINDOW + g,
+            t::R_WINDOW,
             with_alpha(t::SCRIM, 0.42 / 8.0 * (1.0 - i as f32 / 9.0)),
         );
     }
@@ -871,7 +886,7 @@ fn draw_popup(m: &mut Menu, w: &mut W<'_, '_>, reg: &Registry, pop: Popup) {
         let g = i as f32 * 3.0;
         w.p.rounded(
             [r[0] - g, r[1] - g + 4.0, r[2] + 2.0 * g, r[3] + 2.0 * g],
-            t::R_POPUP + g,
+            t::R_POPUP,
             with_alpha(t::SCRIM, 0.12 / i as f32),
         );
     }

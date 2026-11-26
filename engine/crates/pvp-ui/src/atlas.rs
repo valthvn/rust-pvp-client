@@ -32,6 +32,8 @@ pub struct Atlas {
     /// An allocation failed: the owner clears the atlas before the next frame draws (never mid-frame, when
     /// sprites already emitted still point into it).
     pub full: bool,
+    /// The last size that found no room (diagnostics).
+    pub refused: Option<(u32, u32)>,
 }
 
 /// One empty pixel around every image, so linear filtering never bleeds a neighbour in.
@@ -47,6 +49,7 @@ impl Atlas {
             dirty: true,
             generation: 0,
             full: false,
+            refused: None,
         }
     }
 
@@ -55,24 +58,34 @@ impl Atlas {
         let (pw, ph) = (w + PAD * 2, h + PAD * 2);
         if pw > self.width || ph > self.height {
             self.full = true;
+            self.refused = Some((w, h));
             return None;
         }
         // The lowest shelf it fits on, wasting the least height.
         let mut best: Option<usize> = None;
         for (i, &(_, sh, next)) in self.shelves.iter().enumerate() {
-            if sh >= ph && self.width - next >= pw && best.is_none_or(|b| self.shelves[b].1 > sh) {
+            // A shelf at most 8 px taller than the image, so short images don't waste tall shelves.
+            if sh >= ph
+                && sh < ph + 8
+                && self.width - next >= pw
+                && best.is_none_or(|b| self.shelves[b].1 > sh)
+            {
                 best = Some(i);
             }
         }
         let i = match best {
             Some(i) => i,
             None => {
+                // New shelves are a multiple of 8 tall, so images of nearby heights share them
+                // instead of each opening a shelf of its own.
+                let sh = ph.div_ceil(8) * 8;
                 let top = self.shelves.last().map_or(0, |&(t, h, _)| t + h);
-                if top + ph > self.height {
+                if top + sh > self.height {
                     self.full = true;
+                    self.refused = Some((w, h));
                     return None;
                 }
-                self.shelves.push((top, ph, 0));
+                self.shelves.push((top, sh, 0));
                 self.shelves.len() - 1
             }
         };
@@ -105,6 +118,11 @@ impl Atlas {
         let i = (((slot.y + y) * self.width + slot.x + x) * 4) as usize;
         self.pixels[i..i + 4].copy_from_slice(&rgba);
         self.dirty = true;
+    }
+
+    /// Height taken by shelves so far.
+    pub fn used_height(&self) -> u32 {
+        self.shelves.last().map_or(0, |&(t, h, _)| t + h)
     }
 
     /// Forgets every image.
@@ -141,6 +159,16 @@ mod tests {
         a.clear();
         assert!(a.alloc(10, 7).is_some());
         assert_eq!(a.generation, 1);
+    }
+
+    #[test]
+    fn images_of_nearby_heights_share_shelves() {
+        let mut a = Atlas::new(1024, 512);
+        // 600 glyph-like images of 40 different heights fit (they would not with a shelf per height).
+        for i in 0..600u32 {
+            assert!(a.alloc(10 + i % 7, 12 + i % 40).is_some(), "image {i}");
+        }
+        assert!(!a.full);
     }
 
     #[test]

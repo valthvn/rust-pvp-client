@@ -18,6 +18,7 @@ horizon-guest-stack = { path = "../horizon-guest-stack" }
 horizon-client = { path = "../horizon-client", default-features = false }
 horizon-mod-host = { path = "../horizon-mod-host", default-features = false }
 horizon-mod-package = { path = "../horizon-mod-package", default-features = false, features = ["index"] }
+horizon-mod-api = { path = "../horizon-mod-api" }
 pvp-core = { path = "../pvp-core" }
 pvp-ui = { path = "../pvp-ui" }
 pvp-modules = { path = "../pvp-modules" }
