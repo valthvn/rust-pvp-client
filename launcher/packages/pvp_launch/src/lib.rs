@@ -10,6 +10,8 @@
 //! The client's files (`pvp-client`, `horizon-prepare`, `research-lock.json`, the exporter sources and the
 //! built-in mods' manifests) live in [`Layout::bin`], as a release of the client ships them.
 
+pub mod profiles;
+
 use oneclient_auth::{AccountKind, MinecraftAccount};
 use std::io::Write;
 use std::path::{Path, PathBuf};

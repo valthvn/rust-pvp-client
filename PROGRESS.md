@@ -166,7 +166,9 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
       non vue à l'écran (derrière la connexion).
 - Connexion Microsoft : le client ID de Polyfrost est refusé par Microsoft pour notre build (« first party
   application … users are not permitted to consent », constaté par l'utilisateur le 26/11). Seule voie : D5.
-- [ ] Installateurs cargo-packager, mises à jour, profils de modules dans le launcher.
+- [x] Profil de modules choisi depuis le launcher : liste déroulante à côté de « Play PvP Client » (`pvp_launch::profiles` :
+      lister, actif, choisir ; même règle de nom que pvp-core ; 6 tests OK). Compile ; non vu à l'écran.
+- [ ] Installateurs cargo-packager.
 - À noter pour la distribution : OneLauncher embarque aussi des clés Polyfrost (CurseForge, Discord) dans
   `oneclient_common/src/constants.rs`.
 

@@ -23,6 +23,11 @@ fn minecraft_dir() -> Option<PathBuf> {
     }
 }
 
+/// The client's game folder, where its module profiles live.
+pub fn instance_dir() -> Option<PathBuf> {
+    layout().map(|(l, _)| l.instance)
+}
+
 /// The client's folders, and whether its files are a developer's build (`PVP_CLIENT_BIN`) never updated.
 fn layout() -> Option<(Layout, bool)> {
     let root = oneclient_common::paths::data_dir().ok()?.join("pvp-client");
