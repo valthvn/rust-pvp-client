@@ -1,6 +1,14 @@
 pub const DUMMY_REPLACE_NEWLINE: &str = "\n";
 
-pub const MICROSOFT_CLIENT_ID: &str = "9419b7ee-1448-4d1b-b52a-550d8f36ab56";
+/// The Azure app the launcher signs in with. Release builds set `PVP_MICROSOFT_CLIENT_ID` to our own app,
+/// approved by Mojang (decision D5; `release.yml` refuses to build without it). Local development builds fall
+/// back to Polyfrost's app id, inherited from OneLauncher, for testing only: never distributed.
+pub const MICROSOFT_CLIENT_ID: &str = match option_env!("PVP_MICROSOFT_CLIENT_ID") {
+    Some(id) if !id.is_empty() => id,
+    _ => POLYFROST_DEV_CLIENT_ID,
+};
+/// OneLauncher's (Polyfrost's) app id: local tests only.
+const POLYFROST_DEV_CLIENT_ID: &str = "9419b7ee-1448-4d1b-b52a-550d8f36ab56";
 pub const MINECRAFT_SCOPES: &str = "XboxLive.SignIn XboxLive.offline_access";
 pub const CURSEFORGE_API_KEY: &str = "$2a$10$6utA1UNSmFPrE/Lh7b7ndeeGmiOkjKNY8kpFB0fsmE/d42ZAfFgCe";
 pub const DISCORD_CLIENT_ID: &str = "1426999264633946334";

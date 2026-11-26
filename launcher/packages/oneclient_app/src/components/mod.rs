@@ -1,5 +1,6 @@
 mod account_switcher;
 mod active_cluster_panel;
+mod pvp_client_button;
 mod asset_image;
 mod avatar;
 mod blocked_downloads_popup;
@@ -75,6 +76,7 @@ mod warning_card;
 
 pub use account_switcher::AccountSwitcher;
 pub use active_cluster_panel::ActiveClusterPanel;
+pub use pvp_client_button::PvpClientButton;
 pub use asset_image::AssetImage;
 pub use avatar::Avatar;
 pub use blocked_downloads_popup::BlockedDownloadsPopup;

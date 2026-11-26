@@ -1,0 +1,16 @@
+[package]
+name = "pvp_launch"
+description = "Starts the native PvP client (Horizon + pvp-core): its files, the prepared resources, the session"
+version.workspace = true
+license = "GPL-3.0-only"
+edition.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+oneclient_auth.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

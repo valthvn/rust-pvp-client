@@ -4687,6 +4687,7 @@ dependencies = [
  "plusrenderer",
  "polyio",
  "pulldown-cmark",
+ "pvp_launch",
  "regex",
  "rfd",
  "rust-embed",
@@ -5539,6 +5540,16 @@ name = "pure-rust-locales"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "869675ad2d7541aea90c6d88c81f46a7f4ea9af8cd0395d38f11a95126998a0d"
+
+[[package]]
+name = "pvp_launch"
+version = "2.12.1"
+dependencies = [
+ "oneclient_auth",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+]
 
 [[package]]
 name = "pxfm"

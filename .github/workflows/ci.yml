@@ -109,7 +109,7 @@ jobs:
     timeout-minutes: 90
     env:
       # Space-separated crates of ours in the launcher workspace, checked strictly (none yet: phase 4).
-      LAUNCHER_OWN_CRATES: ""
+      LAUNCHER_OWN_CRATES: "pvp_launch"
     strategy:
       fail-fast: false
       matrix:

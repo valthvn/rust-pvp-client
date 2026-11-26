@@ -144,7 +144,26 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
       (`shots/p3-block.png` vs `p3-idle.png`).
 - [ ] Recherche/copie du chat non testées en jeu (Ctrl+F, clic) ; onglets/filtres et captures de chat non faits.
 
-### Phase 4
+### Phase 4 (branche `phase4` ; `main` = f9a32d1, phase 3 fusionnée le 26/11)
+- Client ID Microsoft : `MICROSOFT_CLIENT_ID` vient de `PVP_MICROSOFT_CLIENT_ID` à la compilation ; sans lui (build
+  local), celui de Polyfrost hérité d'OneLauncher, **pour tester seulement** (décision de l'utilisateur le 26/11, jamais
+  distribué). `release.yml` refuse de partir sans notre secret (ou avec l'id de Polyfrost).
+- Constaté : `horizon-prepare` seul (binaire + research-lock.json) échoue (« mods/horizon/src/test/java/dev/horizonlab/
+  parity/… introuvable ») ; avec ces sources Java d'Horizon à côté, `--prepare --complete` réussit en 191 s et `--check`
+  rend 0. → `build.yml` les embarque (aucun fichier Mojang).
+- [x] `pvp_launch` (crate à nous, GPL) : porte propriétaire (`Session::for_account` : compte Microsoft connecté
+      seulement), session JSON sur stdin, commandes prepare/check/launch, jar serveur lu dans le JSON de version du
+      joueur. 4 tests OK.
+- [x] Launcher : bouton « Play PvP Client » sur l'accueil → `pvp_client.rs` (compte par défaut rafraîchi, jar serveur
+      téléchargé chez Mojang et vérifié SHA-1, préparation si `--check` échoue, lancement). Compile ; lancé localement.
+      Non vérifié : clic → connexion → partie (demande une connexion Microsoft par l'utilisateur).
+- [x] `release.yml` (à la main seulement, brouillon non publié) ; `build.yml` réutilisable (`workflow_call`).
+- [ ] Téléchargement du client depuis une release (aucune release publiée ; `PVP_CLIENT_BIN` en attendant).
+- [ ] Installateurs cargo-packager, mises à jour, profils de modules dans le launcher.
+- À noter pour la distribution : OneLauncher embarque aussi des clés Polyfrost (CurseForge, Discord) dans
+  `oneclient_common/src/constants.rs`.
+
+### Phase 4 (suite)
 Voir docs/ROADMAP.md ; détaillées ici au démarrage de chaque phase.
 
 ## Blocages et constats importants

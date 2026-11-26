@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use freya::prelude::*;
 
-use crate::components::{
+use crate::components::{PvpClientButton, 
     ActiveClusterPanel, HomeStack, RecentsRow, WheelEdgeChain, normalize_wheel_delta,
 };
 use crate::hooks::use_overlay_claims;
@@ -350,6 +350,14 @@ fn home_page(show: bool) -> Element {
                     .height(Size::flex(1.0))
                     .main_align(Alignment::Center)
                     .child(ActiveClusterPanel),
+            )
+            .child(
+                rect()
+                    .width(Size::fill())
+                    .main_align(Alignment::Center)
+                    .cross_align(Alignment::Center)
+                    .padding(8.)
+                    .child(PvpClientButton),
             )
             .child(RecentsRow)
         })

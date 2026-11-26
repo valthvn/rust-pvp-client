@@ -24,6 +24,7 @@ mod motion;
 mod notifications;
 pub mod platform;
 pub mod protocol;
+mod pvp_client;
 pub mod recovery;
 mod routes;
 pub mod shortcut;

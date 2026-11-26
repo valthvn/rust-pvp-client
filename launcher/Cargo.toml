@@ -34,6 +34,7 @@ oneclient_mc = {path = "./packages/oneclient_mc"}
 oneclient_net = {path = "./packages/oneclient_net"}
 oneclient_polyplus = {path = "./packages/oneclient_polyplus"}
 polyio = {path = "./packages/polyio"}
+pvp_launch = {path = "./packages/pvp_launch"}
 
 # core (extra)
 discord-rich-presence = {version = "=1.1.0"}

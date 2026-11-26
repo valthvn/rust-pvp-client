@@ -1,0 +1,55 @@
+name: release
+
+# A draft GitHub release of the client and the launcher, built with our own Microsoft app id. Run by hand
+# only (publishing is the maintainer's decision); the draft stays unpublished until someone publishes it.
+# Refuses to start without the PVP_MICROSOFT_CLIENT_ID secret: OneLauncher's (Polyfrost's) app id, which
+# development builds fall back to, is never distributed.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of the release (vX.Y.Z)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Our own Microsoft app id is set
+        env:
+          ID: ${{ secrets.PVP_MICROSOFT_CLIENT_ID }}
+        run: |
+          if [ -z "$ID" ] || [ "$ID" = "9419b7ee-1448-4d1b-b52a-550d8f36ab56" ]; then
+            echo "::error::Set the PVP_MICROSOFT_CLIENT_ID secret to our Mojang-approved Azure app id (decision D5)."
+            exit 1
+          fi
+  build:
+    needs: check
+    uses: ./.github/workflows/build.yml
+    secrets:
+      PVP_MICROSOFT_CLIENT_ID: ${{ secrets.PVP_MICROSOFT_CLIENT_ID }}
+  draft:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Archive each platform
+        run: |
+          mkdir out
+          for d in artifacts/*/; do
+            n=$(basename "$d")
+            (cd "$d" && zip -qr "../../out/$n.zip" .)
+          done
+          (cd out && sha256sum *.zip > SHA256SUMS)
+          ls -la out
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" out/* --repo "${{ github.repository }}" \
+            --draft --title "${{ inputs.tag }}" --notes "Draft: built by release.yml; not published."

@@ -7,6 +7,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # release.yml builds through this workflow, with our own Microsoft app id.
+  workflow_call:
+    secrets:
+      PVP_MICROSOFT_CLIENT_ID:
+        required: false
 
 concurrency:
   group: build-${{ github.ref }}
@@ -73,6 +78,10 @@ jobs:
           cp "target/release/horizon-prepare${{ matrix.exe }}" ../dist/
           cp "target/release/horizon-ctl${{ matrix.exe }}" ../dist/
           cp research-lock.json ../dist/
+          # horizon-prepare compiles these Horizon exporter sources with the player's JDK on the first
+          # preparation (it refuses to prepare without them); no Mojang file is shipped.
+          mkdir -p ../dist/mods/horizon/src/test/java/dev/horizonlab
+          cp -r mods/horizon/src/test/java/dev/horizonlab/parity ../dist/mods/horizon/src/test/java/dev/horizonlab/
           cp ../LICENSE ../ATTRIBUTION.md ../dist/
           ls -la ../dist
       - uses: actions/upload-artifact@v4
@@ -113,6 +122,9 @@ jobs:
           shared-key: launcher-release
           cache-on-failure: true
       - name: Build
+        # Empty outside release.yml: the build then signs in with OneLauncher's app id, for local tests only.
+        env:
+          PVP_MICROSOFT_CLIENT_ID: ${{ secrets.PVP_MICROSOFT_CLIENT_ID }}
         run: cargo build --release --locked --bin oneclient_app
       - name: Stage
         run: |

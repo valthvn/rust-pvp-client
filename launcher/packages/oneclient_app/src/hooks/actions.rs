@@ -1181,6 +1181,12 @@ impl Actions {
             .progress(id, t("oneclient.actions.test_progress"), current, total);
     }
 
+    /// Starts the native PvP client for the default account (`crate::pvp_client`).
+    pub fn launch_pvp_client(&self) {
+        let actions = self.clone();
+        spawn_global(async move { crate::pvp_client::launch(&actions).await });
+    }
+
     pub fn launch_cluster(&self, cluster_id: ClusterId) {
         self.launch_with(cluster_id, None);
     }
