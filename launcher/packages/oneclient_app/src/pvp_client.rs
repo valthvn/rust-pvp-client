@@ -200,7 +200,8 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("{e:#}"))?
         .ok_or_else(|| pvp_launch::Error::NotSignedIn.to_string())?;
-    if cfg!(debug_assertions) && account.kind == oneclient_auth::AccountKind::Offline {
+    if oneclient_auth::dev_offline_allowed() && account.kind == oneclient_auth::AccountKind::Offline
+    {
         return run_developer_offline();
     }
     let session = Session::for_account(&account).map_err(|e| e.to_string())?;

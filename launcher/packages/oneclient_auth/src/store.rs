@@ -91,7 +91,7 @@ impl CredentialsStore {
     }
 
     fn insert_offline_account(&mut self, username: String) -> AuthResult<MinecraftAccount> {
-        if !self.has_microsoft_account() {
+        if !crate::dev_offline_allowed() && !self.has_microsoft_account() {
             return Err(AuthError::OfflineRequiresMicrosoft);
         }
 
@@ -205,7 +205,7 @@ impl CredentialsStore {
             return Ok(None);
         };
 
-        if account.is_offline() && !self.has_microsoft_account() {
+        if !crate::dev_offline_allowed() && account.is_offline() && !self.has_microsoft_account() {
             return Err(AuthError::OfflineRequiresMicrosoft);
         }
 

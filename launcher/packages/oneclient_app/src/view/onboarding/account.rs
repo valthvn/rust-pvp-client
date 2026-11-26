@@ -39,7 +39,7 @@ impl Component for OnboardingAccount {
                     let card = sign_in_card(msa.pending, msa.error.clone(), move |_| start.start());
                     // Development builds only: a local account, to test the launcher and the PvP client
                     // (single player) before the Azure app is approved. Never compiled into a release.
-                    if cfg!(debug_assertions) {
+                    if oneclient_auth::dev_offline_allowed() {
                         rect()
                             .vertical()
                             .spacing(8.)

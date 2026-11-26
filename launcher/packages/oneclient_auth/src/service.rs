@@ -387,7 +387,10 @@ impl AuthService {
             Err(err) => return Err(err),
         };
 
-        if account.is_offline() && !self.has_microsoft_account().await {
+        if !crate::dev_offline_allowed()
+            && account.is_offline()
+            && !self.has_microsoft_account().await
+        {
             return Err(AuthError::OfflineRequiresMicrosoft);
         }
 
