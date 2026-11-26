@@ -549,6 +549,37 @@ pub fn set_frame_override(f: fn(Frame) -> Frame) -> bool {
     FRAME_OVERRIDE.set(f).is_ok()
 }
 
+/// A replacement for the chat options ([`ChatOptions`]), installed once at start like the frame override.
+static CHAT_OVERRIDE: std::sync::OnceLock<fn(ChatOptions) -> ChatOptions> =
+    std::sync::OnceLock::new();
+
+/// Installs the chat options override; false when one already is.
+pub fn set_chat_override(f: fn(ChatOptions) -> ChatOptions) -> bool {
+    CHAT_OVERRIDE.set(f).is_ok()
+}
+
+/// `chat` as the installed override changes it.
+pub fn chat_overridden(chat: ChatOptions) -> ChatOptions {
+    CHAT_OVERRIDE.get().map_or(chat, |f| f(chat))
+}
+
+/// A replacement for Combat feel's look (legacy pictures, indicator, sounds), installed once at start like
+/// the frame override. The rules a hosted world fights by (`Combat::rules`) are never overridden.
+static COMBAT_OVERRIDE: std::sync::OnceLock<fn(Combat) -> Combat> = std::sync::OnceLock::new();
+
+/// Installs the Combat feel look override; false when one already is.
+pub fn set_combat_override(f: fn(Combat) -> Combat) -> bool {
+    COMBAT_OVERRIDE.set(f).is_ok()
+}
+
+/// `combat` as the installed override changes its look, its rules kept.
+pub fn combat_overridden(combat: Combat) -> Combat {
+    COMBAT_OVERRIDE.get().map_or(combat, |f| Combat {
+        rules: combat.rules,
+        ..f(combat)
+    })
+}
+
 /// `frame` as the installed override changes it.
 pub fn overridden(frame: Frame) -> Frame {
     FRAME_OVERRIDE.get().map_or(frame, |f| f(frame))

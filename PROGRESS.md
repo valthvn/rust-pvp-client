@@ -127,7 +127,24 @@ que le dépôt est public), ou à défaut `tools/ci-local.sh` (journal `engine/.
 - [ ] Flou de menu.
 - [ ] e2e par module, bench tout activé / tout désactivé.
 
-### Phase 3 / 4
+### Phase 3 (branche `phase3` ; `main` = 8c79168, phase 2 fusionnée le 26/11)
+- Périmètre : chat, particules, animations. Le confort Hypixel (Hytils) a été retiré de docs/ROADMAP.md (modification
+  locale non commitée, pas de moi) : traité comme une décision de l'utilisateur, non implémenté.
+- Horizon a déjà ces fonctions en interne sans API de mods → trois boutons moteur de plus, même forme que
+  `set_frame_override` (rien d'installé = comportement inchangé) : `pvp::set_chat_override`,
+  `pvp::set_combat_override` (apparence seulement : `Combat::rules` n'est jamais remplacé),
+  `ParticleEngine::set_scale` (multiplicateur par type dans `add_with`, fractions accumulées, sans RNG).
+- [x] Chat (`chat.rs`) : horodatage, compactage, copie au clic, Ctrl+F. Constaté en jeu le 26/11 : « [19:16] <…> hello
+      (x3) » après trois envois.
+- [x] Particules (`particles.rs`) : crit, enchanted_hit (×0-10), sweep, cœurs de dégâts, explosions (masquer), autres
+      (×0-2). Constaté via `horizon-ctl status` : 300 flammes demandées → 0 (autres = 0) ; 100 crits → 100 (×1) puis
+      300 (×3).
+- [x] Animations 1.8 (`animations.rs`, via Combat feel Legacy d'Horizon) : blocage à l'épée, pose et swing 1.8.9,
+      indicateur d'attaque, sons 1.9 coupés. Constaté en jeu : clic droit maintenu → épée en position de blocage
+      (`shots/p3-block.png` vs `p3-idle.png`).
+- [ ] Recherche/copie du chat non testées en jeu (Ctrl+F, clic) ; onglets/filtres et captures de chat non faits.
+
+### Phase 4
 Voir docs/ROADMAP.md ; détaillées ici au démarrage de chaque phase.
 
 ## Blocages et constats importants

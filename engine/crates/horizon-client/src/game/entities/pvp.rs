@@ -228,11 +228,15 @@ impl Game<'_> {
 
     /// Combat feel Legacy's pictures: 1.8.9's sword block, flat item pose and hand swing.
     pub(in crate::game) fn pvp_legacy_look(&self) -> bool {
-        self.settings.extras.pvp.combat.legacy
+        self.pvp_combat_look().legacy
+    }
+    /// Combat feel's look: the options', as an embedding client's override changes it.
+    fn pvp_combat_look(&self) -> horizon_client::pvp::Combat {
+        horizon_client::pvp::combat_overridden(self.settings.extras.pvp.combat)
     }
     /// Combat feel Legacy hides the attack indicator unless the player keeps it.
     pub(in crate::game) fn pvp_hides_attack_indicator(&self) -> bool {
-        let combat = self.settings.extras.pvp.combat;
+        let combat = self.pvp_combat_look();
         combat.legacy && !combat.indicator
     }
     /// Legacy rules: the hits a server resolves follow 1.8.9 (`legacy_rules.rs`).
@@ -245,11 +249,11 @@ impl Game<'_> {
     }
     /// A sound Combat feel Legacy keeps quiet.
     pub(in crate::game) fn pvp_mutes_sound(&self, name: &str) -> bool {
-        self.settings.extras.pvp.combat.mutes_sound(name)
+        self.pvp_combat_look().mutes_sound(name)
     }
     /// A particle Combat feel Legacy doesn't draw (sweeps, damage hearts).
     pub(in crate::game) fn pvp_hides_particle(&self, ty: ParticleType) -> bool {
-        self.settings.extras.pvp.combat.hides_particle(ty)
+        self.pvp_combat_look().hides_particle(ty)
     }
     /// The block outline, hurt overlay and glint colours the renderer draws with.
     pub(in crate::game) fn pvp_render_frame(&self) -> Frame {
@@ -278,7 +282,7 @@ impl Game<'_> {
     }
     /// The chat's options: Ctrl+F search, copy on click, and the rest (`ChatOptions::qol`).
     pub(in crate::game) fn pvp_chat(&self) -> ChatOptions {
-        self.settings.extras.pvp.chat
+        horizon_client::pvp::chat_overridden(self.settings.extras.pvp.chat)
     }
     /// This player attacked entity `id`, `distance` from the eyes to where the crosshair's
     /// ray met its box (the combo counter waits for the server's report; the reach widget

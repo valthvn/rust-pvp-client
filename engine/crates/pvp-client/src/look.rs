@@ -1,10 +1,13 @@
-//! Glue between the glint and damage tint modules and Horizon's frame override (the only engine knob for
-//! these colours): the modules' colours become the texels the renderer reads.
+//! Glue between modules and the engine knobs that have no mod API (Horizon's frame, chat and particle
+//! overrides): each knob asks the modules on every use, and gives the game's own value back while they are off.
 
-use horizon_client_render::pvp::{Frame, set_frame_override};
+use horizon_client_render::particles::ParticleEngine;
+use horizon_client_render::pvp::{
+    ChatOptions, Combat, Frame, set_chat_override, set_combat_override, set_frame_override,
+};
 use pvp_modules::look::{colours, glint_texel, hurt_texel};
 
-fn apply(mut frame: Frame) -> Frame {
+fn frame(mut frame: Frame) -> Frame {
     let c = colours();
     if let Some(argb) = c.glint {
         frame.glint = glint_texel(argb);
@@ -15,6 +18,37 @@ fn apply(mut frame: Frame) -> Frame {
     frame
 }
 
+fn chat(chat: ChatOptions) -> ChatOptions {
+    match pvp_modules::chat::wanted() {
+        Some(w) => ChatOptions {
+            timestamps: w.timestamps,
+            compact: w.compact,
+            copy: w.copy,
+            search: w.search,
+        },
+        None => chat,
+    }
+}
+
+fn combat(combat: Combat) -> Combat {
+    match pvp_modules::animations::wanted() {
+        Some(w) => Combat {
+            legacy: w.legacy,
+            indicator: w.indicator,
+            sounds: w.sounds,
+            ..combat
+        },
+        None => combat,
+    }
+}
+
+fn particles(name: &'static str) -> f32 {
+    pvp_modules::particles::scale(name)
+}
+
 pub fn install() {
-    set_frame_override(apply);
+    set_frame_override(frame);
+    set_chat_override(chat);
+    set_combat_override(combat);
+    ParticleEngine::set_scale(particles);
 }

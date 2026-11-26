@@ -1684,6 +1684,12 @@ impl ParticleEngine {
     pub fn level_random(&mut self) -> &mut LegacyRandom {
         &mut self.level_random
     }
+    /// How many of a particle type the client shows, by its registry name: `1.0` is vanilla's,
+    /// `0.0` none, `2.5` two and a half on average. Installed once at start by the executable
+    /// embedding the game (a client's particle options); with none, every particle is vanilla's.
+    pub fn set_scale(f: fn(&'static str) -> f32) -> bool {
+        PARTICLE_SCALE.set(f).is_ok()
+    }
     /// `ClientLevel.addParticle`: dropped beyond 32 blocks of the camera unless
     /// the type overrides the limiter, and thinned by the Particles option.
     pub fn add(&mut self, options: &ParticleOptions, p: [f64; 3], v: [f64; 3]) {
@@ -1708,7 +1714,9 @@ impl ParticleEngine {
         }
         let minimal = self.calculate_particle_level(always_show) == 2;
         if override_limiter || options.ty.override_limiter() || (d2 <= 1024.0 && !minimal) {
-            self.create(options, p, v);
+            for _ in 0..scaled_count(options.ty.name()) {
+                self.create(options, p, v);
+            }
         }
     }
     /// `NoxiousGasCloudParticle.spawnNoxiousGasParticle`: the gas, as an
@@ -5333,3 +5341,28 @@ const CREEPER: [[f64; 2]; 12] = [
 mod tests;
 #[cfg(test)]
 mod tick_bench;
+
+/// The installed particle scale ([`ParticleEngine::set_scale`]).
+static PARTICLE_SCALE: std::sync::OnceLock<fn(&'static str) -> f32> = std::sync::OnceLock::new();
+
+thread_local! {
+    /// The fractions of particles owed so far, so a scale of 1.5 shows three for every two asked.
+    static OWED: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+}
+
+/// How many particles of type `name` to create for one asked: 1 with no scale installed.
+fn scaled_count(name: &'static str) -> u32 {
+    let Some(f) = PARTICLE_SCALE.get() else {
+        return 1;
+    };
+    let scale = f(name);
+    if scale == 1.0 || !scale.is_finite() {
+        return 1;
+    }
+    OWED.with(|owed| {
+        let total = owed.get() + scale.clamp(0.0, 10.0);
+        let n = total.floor();
+        owed.set(total - n);
+        n as u32
+    })
+}

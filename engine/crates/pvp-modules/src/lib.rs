@@ -2,7 +2,9 @@
 //! (`docs/MODULES.md`) on `pvp_core::Module`; none copies Polyfrost code.
 #![forbid(unsafe_code)]
 
+pub mod animations;
 pub mod armour;
+pub mod chat;
 pub mod crosshair;
 pub mod effects;
 pub mod fps;
@@ -11,6 +13,7 @@ pub mod info;
 pub mod keystrokes;
 pub mod look;
 pub mod nametags;
+pub mod particles;
 pub mod sky;
 pub mod text;
 pub mod toggle_sprint;
@@ -35,4 +38,7 @@ pub static ALL: &[&dyn Module] = &[
     &sky::SKY,
     &look::GLINT,
     &look::DAMAGE_TINT,
+    &particles::PARTICLES,
+    &chat::CHAT,
+    &animations::ANIMATIONS,
 ];
